@@ -385,8 +385,10 @@ class MOTR(nn.Module):
         self.my_clip, self.my_preprocess = clip.load("ViT-B/32", device=device)
         self.my_clip.float()
         self.clip_text_proj = nn.Linear(512, transformer.d_model)
-        self.clip_img_proj = nn.Linear(transformer.d_model, transformer.d_model)
+        self.clip_img_proj = nn.Linear(512, transformer.d_model)
         self.temperature = nn.Parameter(torch.zeros(1), requires_grad=True) #temperature
+        # NOTE: distillation
+        self.img2clip_proj = nn.Linear(transformer.d_model, transformer.d_model)
 
         self.num_queries = num_queries
         self.track_embed = track_embed
@@ -502,7 +504,7 @@ class MOTR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b, }
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def _forward_single_image(self, samples, track_instances: Instances, gtboxes=None):
+    def _forward_single_image(self, samples, pure_image, track_instances: Instances, gtboxes=None):
         features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -545,6 +547,11 @@ class MOTR(nn.Module):
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
+        # NOTE:distillation
+        pure_image = F.interpolate(pure_image.unsqueeze(0), (224, 224))
+        clip_img_emb = self.my_clip.encode_image(pure_image)
+        img2clip = self.img2clip_proj(hs[-1])
+
         # NOTE:clip text encoder
         with torch.no_grad():
             text = clip.tokenize(["a diagram", "a dog", "a cat"]).to(ref_pts.device)
@@ -561,7 +568,7 @@ class MOTR(nn.Module):
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
             # NOTE:multi-modality embedding
-            img_f = self.clip_img_proj(hs[lvl])
+            img_f = img2clip
             text_e = torch.norm(text_f, dim=-1, keepdim=True)
             img_e = torch.norm(img_f, dim=-1, keepdim=True)
             logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
@@ -574,7 +581,8 @@ class MOTR(nn.Module):
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
             outputs_coord = tmp.sigmoid()
-            outputs_classes.append(outputs_class)
+            # outputs_classes.append(outputs_class)
+            outputs_classes.append(logits)
             outputs_coords.append(outputs_coord)
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
@@ -583,6 +591,9 @@ class MOTR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
+        # NOTE: i add this two to calculate l1 loss
+        out['clip_img_emb'] = clip_img_emb
+        out['img2clip'] = img2clip
         return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
@@ -688,9 +699,10 @@ class MOTR(nn.Module):
 
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, gtboxes, *args):
+                    pure_image = frame
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, pure_image, tmp, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
