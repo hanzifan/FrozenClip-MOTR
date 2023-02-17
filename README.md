@@ -1,4 +1,4 @@
-2.17
+# 2.17
 添加CLIP text embedding（√）
 添加CLIP image embedding进行蒸馏（WIP）
 修改cls branch的loss计算方式（WIP）
