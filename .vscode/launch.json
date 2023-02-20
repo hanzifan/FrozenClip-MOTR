@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "env": { "CUDA_VISIBLE_DEVICES": "6"},
+            "env": { "CUDA_VISIBLE_DEVICES": "1"},
             "args": [
                 "--meta_arch", "motr",
                 "--dataset_file", "e2e_dance",

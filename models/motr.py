@@ -48,7 +48,8 @@ class ClipMatcher(SetCriterion):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
-        self.num_classes = num_classes
+        # self.num_classes = num_classes
+        self.num_classes = 8
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
@@ -255,6 +256,7 @@ class ClipMatcher(SetCriterion):
                                            num_boxes=1)
             self.losses_dict.update(
                 {'frame_{}_{}'.format(self._current_frame_idx, key): value for key, value in new_track_loss.items()})
+        self.losses_dict.update({'frame_{}_{}'.format(self._current_frame_idx, 'dist_loss'): outputs['dist_loss']})
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -389,12 +391,13 @@ class MOTR(nn.Module):
         self.temperature = nn.Parameter(torch.zeros(1), requires_grad=True) #temperature
         # NOTE: distillation
         self.img2clip_proj = nn.Linear(transformer.d_model, transformer.d_model)
+        self.dist_loss = nn.L1Loss()
 
         self.num_queries = num_queries
         self.track_embed = track_embed
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.num_classes = num_classes
+        self.num_classes = 8
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
@@ -504,7 +507,7 @@ class MOTR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b, }
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def _forward_single_image(self, samples, pure_image, track_instances: Instances, gtboxes=None):
+    def _forward_single_image(self, samples, img_emb, text_emb, track_instances: Instances, gtboxes=None):
         features, pos = self.backbone(samples)
         src, mask = features[-1].decompose()
         assert mask is not None
@@ -548,15 +551,20 @@ class MOTR(nn.Module):
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
         # NOTE:distillation
-        pure_image = F.interpolate(pure_image.unsqueeze(0), (224, 224))
-        clip_img_emb = self.my_clip.encode_image(pure_image)
+        # with torch.no_grad:
+        #     pure_image = F.interpolate(pure_image.unsqueeze(0), (224, 224))
+        #     clip_img_emb = self.my_clip.encode_image(pure_image)
+        clip_img_emb = img_emb
+        clip_img_emb = self.clip_img_proj(clip_img_emb)
         img2clip = self.img2clip_proj(hs[-1])
+        l1_loss = self.dist_loss(clip_img_emb, img2clip[:, -1, :])
 
         # NOTE:clip text encoder
-        with torch.no_grad():
-            text = clip.tokenize(["a diagram", "a dog", "a cat"]).to(ref_pts.device)
-            text_f = self.my_clip.encode_text(text)
-            text_f = text_f.view(-1, text_f.shape[-2], text_f.shape[-1])
+        # with torch.no_grad():
+        #     text = clip.tokenize(["pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"]).to(ref_pts.device)
+        #     text_f = self.my_clip.encode_text(text)
+        #     text_f = text_f.view(-1, text_f.shape[-2], text_f.shape[-1])
+        text_f = text_emb
         text_f = self.clip_text_proj(text_f)
 
         outputs_classes = []
@@ -572,6 +580,8 @@ class MOTR(nn.Module):
             text_e = torch.norm(text_f, dim=-1, keepdim=True)
             img_e = torch.norm(img_f, dim=-1, keepdim=True)
             logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
+            logits = logits - torch.mean(logits)
+            logits = logits.sigmoid()
 
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
@@ -591,9 +601,8 @@ class MOTR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
-        # NOTE: i add this two to calculate l1 loss
-        out['clip_img_emb'] = clip_img_emb
-        out['img2clip'] = img2clip
+        # NOTE: i add this l1 loss
+        out['dist_loss'] = l1_loss
         return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
@@ -671,13 +680,17 @@ class MOTR(nn.Module):
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'])
         frames = data['imgs']  # list of Tensor.
+        # NOTE:clip preprocess embedding
+        img_embs = data['img_emb']
+        text_embs= data['text_emb']
         outputs = {
             'pred_logits': [],
             'pred_boxes': [],
         }
         track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
-        for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
+        # for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
+        for frame_index, (frame, gt, img_emb, text_emb) in enumerate(zip(frames, data['gt_instances'], img_embs, text_embs)):
             frame.requires_grad = False
             is_last = frame_index == len(frames) - 1
 
@@ -691,22 +704,24 @@ class MOTR(nn.Module):
                 gtboxes = None
 
             if track_instances is None:
-                track_instances = self._generate_empty_tracks(proposals)
+                # track_instances = self._generate_empty_tracks(proposals)
+                track_instances = self._generate_empty_tracks()
             else:
                 track_instances = Instances.cat([
-                    self._generate_empty_tracks(proposals),
+                    # self._generate_empty_tracks(proposals),
+                    self._generate_empty_tracks(),
                     track_instances])
 
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, gtboxes, *args):
-                    pure_image = frame
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, pure_image, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, img_emb, text_emb, tmp, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
                         frame_res['hs'],
+                        frame_res['dist_loss'],
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
@@ -718,14 +733,16 @@ class MOTR(nn.Module):
                     'pred_logits': tmp[0],
                     'pred_boxes': tmp[1],
                     'hs': tmp[2],
+                    'dist_loss': tmp[3],
                     'aux_outputs': [{
-                        'pred_logits': tmp[3+i],
-                        'pred_boxes': tmp[3+5+i],
+                        'pred_logits': tmp[4+i],
+                        'pred_boxes': tmp[4+5+i],
                     } for i in range(5)],
                 }
             else:
+                pure_image = frame
                 frame = nested_tensor_from_tensor_list([frame])
-                frame_res = self._forward_single_image(frame, track_instances, gtboxes)
+                frame_res = self._forward_single_image(frame, img_emb, text_emb, track_instances, gtboxes)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']

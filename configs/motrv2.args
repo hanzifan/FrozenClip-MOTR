@@ -1,11 +1,11 @@
 --meta_arch motr
 --dataset_file e2e_dance
---epoch 5
+--epoch 20
 --with_box_refine
 --lr_drop 4
 --lr 2e-4
 --lr_backbone 2e-5
---pretrained /data/projects/motr_mod/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
+--pretrained /home/hzf/project/MOTRv2_u/pretrained/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
 --batch_size 1
 --sample_mode random_interval
 --sample_interval 10
