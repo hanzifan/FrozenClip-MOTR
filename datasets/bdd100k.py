@@ -55,8 +55,8 @@ class DetMOTDetection:
             self.num_frames_per_batch = self.lengths[0]
             self.current_epoch = 0
 
-        self.text_emb = np.load("/home/hzf/data/bdd/bdd100k/clip-preprocessing/text-embedding_clip.npy", allow_pickle=True)
-        self.img_emb = np.load("/home/hzf/data/bdd/bdd100k/clip-preprocessing/image-embedding.npy", allow_pickle=True).item()
+        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding.npy", allow_pickle=True)
+        # self.img_emb = np.load("/home/hzf/data/bdd/bdd100k/clip-preprocessing/image-embedding.npy", allow_pickle=True).item()
         print()
 
     def _register_videos(self):
@@ -123,7 +123,7 @@ class DetMOTDetection:
         targets['image_id'] = torch.as_tensor(idx)
         targets['size'] = torch.as_tensor([h, w])
         targets['orig_size'] = torch.as_tensor([h, w])
-        targets['img_emb'] = self.img_emb[frame_name]
+        # targets['img_emb'] = self.img_emb[frame_name]
         targets['text_emb'] = torch.from_numpy(self.text_emb)
         for label in labels:
             targets['boxes'].append(label[2:6].tolist())
@@ -181,16 +181,16 @@ class DetMOTDetection:
         if self._transforms is not None:
             images, targets = self._transforms(images, targets)
         gt_instances = []
-        img_emb = []
+        # img_emb = []
         text_emb = []
         for img_i, targets_i in zip(images, targets):
             gt_instances_i = self._targets_to_instances(targets_i, img_i.shape[1:3])
             gt_instances.append(gt_instances_i)
-            img_emb.append(targets_i['img_emb'])
+            # img_emb.append(targets_i['img_emb'])
             text_emb.append(targets_i['text_emb'])
         data.update({
             'imgs': images,
-            'img_emb': img_emb,
+            # 'img_emb': img_emb,
             'text_emb': text_emb,
             'gt_instances': gt_instances,
         })

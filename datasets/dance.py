@@ -101,6 +101,8 @@ class DetMOTDetection:
         else:
             self.det_db = defaultdict(list)
 
+        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding.npy", allow_pickle=True)
+
     def set_epoch(self, epoch):
         self.current_epoch = epoch
         if self.sampler_steps is None or len(self.sampler_steps) == 0:
@@ -154,6 +156,7 @@ class DetMOTDetection:
             'size': torch.as_tensor([h, w]),
             'orig_size': torch.as_tensor([h, w]),
             'dataset': "CrowdHuman",
+            'text_emb':torch.from_numpy(self.text_emb)
         }
         rs = T.FixedMotRandomShift(self.num_frames_per_batch)
         return rs([img], [target])
@@ -175,6 +178,7 @@ class DetMOTDetection:
         targets['image_id'] = torch.as_tensor(idx)
         targets['size'] = torch.as_tensor([h, w])
         targets['orig_size'] = torch.as_tensor([h, w])
+        targets['text_emb'] = torch.from_numpy(self.text_emb)
         for *xywh, id, crowd in self.labels_full[vid][idx]:
             targets['boxes'].append(xywh)
             assert not crowd
@@ -227,9 +231,11 @@ class DetMOTDetection:
         if self.transform is not None:
             images, targets = self.transform(images, targets)
         gt_instances, proposals = [], []
+        text_emb = []
         for img_i, targets_i in zip(images, targets):
             gt_instances_i = self._targets_to_instances(targets_i, img_i.shape[1:3])
             gt_instances.append(gt_instances_i)
+            text_emb.append(targets_i['text_emb'])
             n_gt = len(targets_i['labels'])
             proposals.append(torch.cat([
                 targets_i['boxes'][n_gt:],
@@ -239,6 +245,7 @@ class DetMOTDetection:
             'imgs': images,
             'gt_instances': gt_instances,
             'proposals': proposals,
+            'text_emb': text_emb,
         }
 
     def __len__(self):
