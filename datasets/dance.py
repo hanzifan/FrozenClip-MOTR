@@ -26,6 +26,8 @@ import datasets.transforms as T
 from models.structures import Instances
 
 from random import choice, randint
+from pycocotools.coco import COCO
+import glob, tqdm, os
 
 
 def is_crowd(ann):
@@ -95,13 +97,30 @@ class DetMOTDetection:
         # self.ch_indices = self.ch_indices + self.ch_indices
         print(f"Found {len(self.ch_indices)} images")
 
+        # NOTE: add lvis dataset
+        # load lvis
+        lvis_dir_path = "/home/hzf/data/lvis"
+        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/instances_train2017.json")
+        resolve = COCO(lvis_anno_path)
+        self.lvis_img_list = glob.glob(os.path.join(lvis_dir_path, 'train2017') + "/*") 
+        self.lvis_anno_list = {}
+        for i in tqdm.tqdm(range(len(self.lvis_img_list))):
+            name = self.lvis_img_list[i]
+            current_id = int(os.path.splitext(os.path.basename(name))[0])
+            # if(resolve.getAnnIds(imgIds=current_id) == []):
+            #     os.remove(name)
+            #     continue
+            current_anno = resolve.loadAnns(resolve.getAnnIds(imgIds=current_id))[0]
+            self.lvis_anno_list[current_id] = current_anno
+            print()
+        
         if args.det_db:
             with open(os.path.join(args.mot_path, args.det_db)) as f:
                 self.det_db = json.load(f)
         else:
             self.det_db = defaultdict(list)
 
-        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding.npy", allow_pickle=True)
+        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding_coco.npy", allow_pickle=True)
 
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -127,6 +146,13 @@ class DetMOTDetection:
         gt_instances.boxes = targets['boxes'][:n_gt]
         gt_instances.labels = targets['labels']
         gt_instances.obj_ids = targets['obj_ids']
+        return gt_instances
+
+    @staticmethod
+    def lvis_target_to_instance(targets: dict, img_shape) -> Instances:
+        gt_instances = Instances(tuple(img_shape))
+        gt_instances.labels = torch.tensor([[targets['category_id']]])
+        gt_instances.bbox = targets['bbox']
         return gt_instances
 
     def load_crowd(self, index):
@@ -241,11 +267,41 @@ class DetMOTDetection:
                 targets_i['boxes'][n_gt:],
                 targets_i['scores'][n_gt:, None],
             ], dim=1))
+        if idx > len(self.lvis_img_list) - 1:
+            new_idx = idx % (len(self.lvis_img_list) - 1)
+            lvis_img_path = self.lvis_img_list[new_idx]
+            lvis_img = Image.open(lvis_img_path)
+            lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
+            temp = torch.as_tensor([lvis_anno['bbox']])
+            temp[0][2] = temp[0][0] + temp[0][2]
+            temp[0][3] = temp[0][1] + temp[0][3]
+            del lvis_anno['bbox']
+            lvis_anno['boxes'] = temp
+            lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
+            del lvis_anno['boxes']
+            lvis_anno['bbox'] = temp
+            lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+        else:
+            lvis_img_path = self.lvis_img_list[idx]
+            lvis_img = Image.open(lvis_img_path)
+            lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
+            temp = torch.as_tensor([lvis_anno['bbox']])
+            temp[0][2] = temp[0][0] + temp[0][2]
+            temp[0][3] = temp[0][1] + temp[0][3]
+            del lvis_anno['bbox']
+            lvis_anno['boxes'] = temp
+            lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
+            temp = lvis_anno[0]['boxes']
+            del lvis_anno[0]['boxes']
+            lvis_anno[0]['bbox'] = temp
+            lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
         return {
             'imgs': images,
             'gt_instances': gt_instances,
             'proposals': proposals,
             'text_emb': text_emb,
+            'lvis_img': lvis_img,
+            'lvis_gt': lvis_anno_instance,
         }
 
     def __len__(self):

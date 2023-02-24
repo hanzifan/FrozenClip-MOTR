@@ -50,7 +50,7 @@ class ClipMatcher(SetCriterion):
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         # self.num_classes = num_classes
-        self.num_classes = 8
+        self.num_classes = 80
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
@@ -156,6 +156,7 @@ class ClipMatcher(SetCriterion):
         target_classes[idx] = target_classes_o
         if self.focal_loss:
             gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[:, :, :-1]  # no loss for the last (background) class
+            # gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes)[:, :, :-1]
             gt_labels_target = gt_labels_target.to(src_logits)
             loss_ce = sigmoid_focal_loss(src_logits.flatten(1),
                                              gt_labels_target.flatten(1),
@@ -405,7 +406,7 @@ class MOTR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         # self.num_clsses = num_classes
-        self.num_classes = 8
+        self.num_classes = 80
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
@@ -517,6 +518,7 @@ class MOTR(nn.Module):
 
     def _forward_single_image(self, samples, pure_img, text_emb, track_instances: Instances, gtboxes=None):
         # features, pos = self.backbone(samples)
+        # use frozen clip image encoder as backbone
         with torch.no_grad():
             pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
             clip_feature = self.clip_backbone(pure_img)
@@ -573,9 +575,11 @@ class MOTR(nn.Module):
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
+        # do img projection to get the same shape with transformer d_model
         img2clip = self.img2clip_proj(hs[-1])
 
         # NOTE:distillation
+        # clip image encoder
         # with torch.no_grad:
         #     pure_image = F.interpolate(pure_image.unsqueeze(0), (224, 224))
         #     clip_img_emb = self.my_clip.encode_image(pure_image)
@@ -585,10 +589,12 @@ class MOTR(nn.Module):
         # l1_loss = self.dist_loss(clip_img_emb, img2clip[:, -1, :])
 
         # NOTE:clip text encoder
+        # clip text encoder
         # with torch.no_grad():
         #     text = clip.tokenize(["pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"]).to(ref_pts.device)
         #     text_f = self.my_clip.encode_text(text)
         #     text_f = text_f.view(-1, text_f.shape[-2], text_f.shape[-1])
+        # do text projection to get the same shape with transformer d_model
         text_f = text_emb
         text_f = self.clip_text_proj(text_f)
 
@@ -628,6 +634,73 @@ class MOTR(nn.Module):
         out['hs'] = hs[-1]
         # NOTE: i add this l1 loss
         # out['dist_loss'] = l1_loss
+        return out
+
+    def _forward_coco(self, pure_img, text_emb, track_instances: Instances, gt=None):
+        with torch.no_grad():
+            pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
+            clip_feature = self.clip_backbone(pure_img)
+            clip_feature = clip_feature.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+            clip_feature = torch.cat([clip_feature.mean(dim=0, keepdim=True), clip_feature], dim=0)  # (HW+1)NC
+            clip_feature = clip_feature + self.attention_pooling_positional_embedding[:, None, :].to(clip_feature.dtype)  # (HW+1)NC
+            clip_feature = self.attention_pooling_c_proj(self.attention_pooling_v_proj(clip_feature))[1:, :, :]
+            clip_feature = rearrange(clip_feature, '(h w) b c -> b c h w', h=14)
+            clip_feature = torch.sum(clip_feature, dim=0)
+            features = nested_tensor_from_tensor_list([clip_feature])
+
+        src, mask = features.decompose()
+        src = self.cutchannel(src)
+        pos = None
+        srcs = [src]
+        masks = [mask]
+        query_embed = track_instances.query_pos
+        ref_pts = track_instances.ref_pts
+        attn_mask = None
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+            self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
+                             mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
+
+        # do img projection to get the same shape with transformer d_model
+        img2clip = self.img2clip_proj(hs[-1])
+
+        text_f = text_emb
+        text_f = self.clip_text_proj(text_f)
+
+        outputs_classes = []
+        outputs_coords = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            # NOTE:multi-modality embedding
+            img_f = img2clip
+            text_e = torch.norm(text_f, dim=-1, keepdim=True)
+            img_e = torch.norm(img_f, dim=-1, keepdim=True)
+            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
+            logits = logits - torch.mean(logits)
+            logits = logits.sigmoid()
+
+            outputs_class = self.class_embed[lvl](hs[lvl])
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            # outputs_classes.append(outputs_class)
+            outputs_classes.append(logits)
+            outputs_coords.append(outputs_coord)
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
+
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        loss_ce = F.cross_entropy(out['pred_logits'].squeeze(0), gt.labels.squeeze(0))
+        loss_bbox = F.l1_loss(out['pred_boxes'][0], gt.bbox[0].unsqueeze(0), reduction='none')
+        loss_bbox = loss_bbox.sum()
         return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
@@ -714,6 +787,7 @@ class MOTR(nn.Module):
         }
         track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
+        # NOTE:mot dataset train
         # for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
         for frame_index, (frame, gt, text_emb) in enumerate(zip(frames, data['gt_instances'], text_embs)):
             frame.requires_grad = False
@@ -773,6 +847,15 @@ class MOTR(nn.Module):
             track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
+
+        # NOTE:coco dataset train
+        for (frame, gt) in zip(data['lvis_img'], [data['lvis_gt']]):
+            # this track_instance just provide some initial parameter
+            track_instances = self._generate_empty_tracks()
+            frame.requires_grad = False
+            frame_res = self._forward_coco(pure_img, text_emb, track_instances[0], gt)
+            print()
+
 
         if not self.training:
             outputs['track_instances'] = track_instances
