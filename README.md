@@ -16,3 +16,8 @@
 # 2.23
 添加coco数据集用以辅助训练（√）<br/>
 改为f-vlm风格（√）<br/>
+
+# 2.25
+尝试修复classification loss过高的问题（WIP）<br/>
+使用TAO数据集进行训练（WIP）<br/>
+使用BDD100k测试（WIP）<br/>
