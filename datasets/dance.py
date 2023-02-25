@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw
 import copy
 import datasets.transforms as T
 from models.structures import Instances
+import torch.nn.functional as F
 
 from random import choice, randint
 from pycocotools.coco import COCO
@@ -99,8 +100,9 @@ class DetMOTDetection:
 
         # NOTE: add lvis dataset
         # load lvis
+        self.lvis_trans = T.Compose([T.ToTensor()])
         lvis_dir_path = "/home/hzf/data/lvis"
-        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/instances_train2017.json")
+        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/lvisv0.5+coco_train.json")
         resolve = COCO(lvis_anno_path)
         self.lvis_img_list = glob.glob(os.path.join(lvis_dir_path, 'train2017') + "/*") 
         self.lvis_anno_list = {}
@@ -112,7 +114,6 @@ class DetMOTDetection:
             #     continue
             current_anno = resolve.loadAnns(resolve.getAnnIds(imgIds=current_id))[0]
             self.lvis_anno_list[current_id] = current_anno
-            print()
         
         if args.det_db:
             with open(os.path.join(args.mot_path, args.det_db)) as f:
@@ -120,7 +121,7 @@ class DetMOTDetection:
         else:
             self.det_db = defaultdict(list)
 
-        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding_coco.npy", allow_pickle=True)
+        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding_lvis.npy", allow_pickle=True)
 
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -267,34 +268,27 @@ class DetMOTDetection:
                 targets_i['boxes'][n_gt:],
                 targets_i['scores'][n_gt:, None],
             ], dim=1))
-        if idx > len(self.lvis_img_list) - 1:
-            new_idx = idx % (len(self.lvis_img_list) - 1)
-            lvis_img_path = self.lvis_img_list[new_idx]
+        
+        # load lvis
+        new_idx = idx % (len(self.lvis_img_list) - 1)
+        lvis_img_path = self.lvis_img_list[new_idx]
+        while(True):
             lvis_img = Image.open(lvis_img_path)
-            lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
-            temp = torch.as_tensor([lvis_anno['bbox']])
-            temp[0][2] = temp[0][0] + temp[0][2]
-            temp[0][3] = temp[0][1] + temp[0][3]
-            del lvis_anno['bbox']
-            lvis_anno['boxes'] = temp
-            lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
-            del lvis_anno['boxes']
-            lvis_anno['bbox'] = temp
-            lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
-        else:
-            lvis_img_path = self.lvis_img_list[idx]
-            lvis_img = Image.open(lvis_img_path)
-            lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
-            temp = torch.as_tensor([lvis_anno['bbox']])
-            temp[0][2] = temp[0][0] + temp[0][2]
-            temp[0][3] = temp[0][1] + temp[0][3]
-            del lvis_anno['bbox']
-            lvis_anno['boxes'] = temp
-            lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
-            temp = lvis_anno[0]['boxes']
-            del lvis_anno[0]['boxes']
-            lvis_anno[0]['bbox'] = temp
-            lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+            if lvis_img.mode == 'RGB':
+                break
+            else:
+                new_idx = (new_idx + 1) % (len(self.lvis_img_list) - 1)
+                lvis_img_path = self.lvis_img_list[new_idx]
+                continue
+        lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
+        lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
+        boxes = torch.as_tensor([lvis_anno[0]['bbox']])
+        w = lvis_img[0].shape[1]
+        h = lvis_img[0].shape[2]
+        boxes = boxes/torch.tensor([[w, h, w, h]], dtype=torch.float32)
+        lvis_anno[0]['bbox'] = boxes
+        lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+
         return {
             'imgs': images,
             'gt_instances': gt_instances,

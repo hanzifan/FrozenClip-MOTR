@@ -17,7 +17,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='clip preprocessing')
     parser.add_argument('--data_name', default='bdd100k')
     parser.add_argument('--base_path', default='/home/hzf/data/bdd/')
-    parser.add_argument('--lvis_path', default='/home/hzf/data/lvis/annotations/coco_classes.txt')
+    parser.add_argument('--lvis_path', default='/home/hzf/data/lvis/annotations/lvis_classes.txt')
     args = parser.parse_args()
 
     # load clip model
@@ -37,6 +37,8 @@ if __name__ == '__main__':
     for idx in range(len(lvis_label_list)):
         if lvis_label_list[idx] in bdd_list:
             lvis_label_list[idx] = 'None'
+    lvis_label_list.insert(0, "pedestrian")
+    print(len(lvis_label_list))
     label_emb = clip.tokenize(lvis_label_list).to(device)
     # image_prompt = {}
     text_prompt = {}

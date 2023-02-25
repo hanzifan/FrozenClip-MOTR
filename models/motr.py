@@ -50,7 +50,7 @@ class ClipMatcher(SetCriterion):
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         # self.num_classes = num_classes
-        self.num_classes = 80
+        self.num_classes = 1232
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
@@ -173,6 +173,13 @@ class ClipMatcher(SetCriterion):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
 
         return losses
+
+    def add_coco_loss(self, outputs: dict):
+        cls_loss = outputs['loss_ce']
+        bbox_loss = outputs['loss_bbox']
+        self.losses_dict.update({'coco_{}'.format('cls_loss'): cls_loss})
+        self.losses_dict.update({'coco_{}'.format('bbox_loss'): bbox_loss})
+
 
     def match_for_single_frame(self, outputs: dict):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
@@ -300,7 +307,8 @@ class ClipMatcher(SetCriterion):
         losses = outputs.pop("losses_dict")
         num_samples = self.get_num_boxes(self.num_samples)
         for loss_name, loss in losses.items():
-            losses[loss_name] /= num_samples
+            if loss_name != 'coco_cls_loss' or loss_name != 'coco_bbox_loss':
+                losses[loss_name] /= num_samples
         return losses
 
 
@@ -399,6 +407,7 @@ class MOTR(nn.Module):
         self.temperature = nn.Parameter(torch.zeros(1), requires_grad=True) #temperature
         # NOTE: distillation
         self.img2clip_proj = nn.Linear(transformer.d_model, transformer.d_model)
+        self.img_clip_align = nn.Linear(transformer.d_model, self.attention_pooling_c_proj.out_features)
         self.dist_loss = nn.L1Loss()
 
         self.num_queries = num_queries
@@ -406,7 +415,7 @@ class MOTR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         # self.num_clsses = num_classes
-        self.num_classes = 80
+        self.num_classes = 1232
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
@@ -576,7 +585,7 @@ class MOTR(nn.Module):
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
         # do img projection to get the same shape with transformer d_model
-        img2clip = self.img2clip_proj(hs[-1])
+        img2clip = self.img_clip_align(hs[-1])
 
         # NOTE:distillation
         # clip image encoder
@@ -596,7 +605,7 @@ class MOTR(nn.Module):
         #     text_f = text_f.view(-1, text_f.shape[-2], text_f.shape[-1])
         # do text projection to get the same shape with transformer d_model
         text_f = text_emb
-        text_f = self.clip_text_proj(text_f)
+        # text_f = self.clip_text_proj(text_f)
 
         outputs_classes = []
         outputs_coords = []
@@ -608,11 +617,12 @@ class MOTR(nn.Module):
             reference = inverse_sigmoid(reference)
             # NOTE:multi-modality embedding
             img_f = img2clip
-            text_e = torch.norm(text_f, dim=-1, keepdim=True)
-            img_e = torch.norm(img_f, dim=-1, keepdim=True)
-            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
-            logits = logits - torch.mean(logits)
-            logits = logits.sigmoid()
+            text_e = F.normalize(text_f, dim=-1)
+            img_e = F.normalize(img_f, dim=-1)
+            # logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
+            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * 100
+            # logits = logits - torch.mean(logits)
+            logits = logits.softmax(dim=-1)
 
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
@@ -662,10 +672,10 @@ class MOTR(nn.Module):
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
         # do img projection to get the same shape with transformer d_model
-        img2clip = self.img2clip_proj(hs[-1])
+        img2clip = self.img_clip_align(hs[-1])
 
         text_f = text_emb
-        text_f = self.clip_text_proj(text_f)
+        # text_f = self.clip_text_proj(text_f)
 
         outputs_classes = []
         outputs_coords = []
@@ -677,11 +687,12 @@ class MOTR(nn.Module):
             reference = inverse_sigmoid(reference)
             # NOTE:multi-modality embedding
             img_f = img2clip
-            text_e = torch.norm(text_f, dim=-1, keepdim=True)
-            img_e = torch.norm(img_f, dim=-1, keepdim=True)
-            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
-            logits = logits - torch.mean(logits)
-            logits = logits.sigmoid()
+            text_e = F.normalize(text_f, dim=-1)
+            img_e = F.normalize(img_f, dim=-1)
+            # logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
+            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * 100
+            # logits = logits - torch.mean(logits)
+            logits = logits.softmax(dim=-1)
 
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
@@ -701,7 +712,8 @@ class MOTR(nn.Module):
         loss_ce = F.cross_entropy(out['pred_logits'].squeeze(0), gt.labels.squeeze(0))
         loss_bbox = F.l1_loss(out['pred_boxes'][0], gt.bbox[0].unsqueeze(0), reduction='none')
         loss_bbox = loss_bbox.sum()
-        return out
+        loss = {'loss_ce':loss_ce, 'loss_bbox':loss_bbox}
+        return loss
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         if self.query_denoise > 0:
@@ -853,8 +865,9 @@ class MOTR(nn.Module):
             # this track_instance just provide some initial parameter
             track_instances = self._generate_empty_tracks()
             frame.requires_grad = False
-            frame_res = self._forward_coco(pure_img, text_emb, track_instances[0], gt)
-            print()
+            loss = self._forward_coco(pure_img, text_emb, track_instances[0], gt)
+            outputs = loss
+            self.criterion.add_coco_loss(outputs)
 
 
         if not self.training:
