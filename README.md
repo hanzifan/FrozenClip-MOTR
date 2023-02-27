@@ -24,6 +24,6 @@
 
 # 2.27
 尝试修复classification loss过高的问题（√）<br/>
-尝试修复新加入的coco数据classification loss过高的问题（WIP）<br/>
+尝试修复新加入的coco数据classification loss过高的问题（√）<br/>
 使用TAO数据集进行训练（WIP）<br/>
 使用BDD100k测试（WIP）<br/>
