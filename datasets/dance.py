@@ -152,8 +152,8 @@ class DetMOTDetection:
     @staticmethod
     def lvis_target_to_instance(targets: dict, img_shape) -> Instances:
         gt_instances = Instances(tuple(img_shape))
-        gt_instances.labels = torch.tensor([[targets['category_id']]])
-        gt_instances.bbox = targets['bbox']
+        gt_instances.labels = torch.tensor([targets['category_id']])
+        gt_instances.boxes = targets['bbox']
         return gt_instances
 
     def load_crowd(self, index):

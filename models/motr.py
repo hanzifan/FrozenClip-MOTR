@@ -106,6 +106,39 @@ class ClipMatcher(SetCriterion):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, gt_instances, indices, num_boxes, **kwargs)
 
+    def get_coco_loss(self, loss, outputs, gt_instances, indices, num_boxes, **kwargs):
+        loss_map = {
+            'labels': self.loss_labels,
+            'cardinality': self.loss_cardinality,
+            'boxes': self.coco_loss_boxes,
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, gt_instances, indices, num_boxes, **kwargs)
+
+    def coco_loss_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        gt_boxes = []
+        for item in targets:
+            gt_boxes.append({'boxes':item.boxes})
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(gt_boxes, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        return losses
+
     def loss_boxes(self, outputs, gt_instances: List[Instances], indices: List[tuple], num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
@@ -149,6 +182,7 @@ class ClipMatcher(SetCriterion):
         labels = []
         for gt_per_img, (_, J) in zip(gt_instances, indices):
             labels_per_img = torch.ones_like(J)
+            labels_per_img = labels_per_img.to(gt_per_img.labels.device)
             # set labels of track-appear slots to 0.
             if len(gt_per_img) > 0:
                 labels_per_img[J != -1] = gt_per_img.labels[J[J != -1]]
@@ -224,7 +258,7 @@ class ClipMatcher(SetCriterion):
 
         def match_for_single_decoder_layer(unmatched_outputs, matcher):
             new_track_indices = matcher(unmatched_outputs,
-                                             [untracked_gt_instances])  # list[tuple(src_idx, tgt_idx)]
+                                             [untracked_gt_instances], use_focal=False)  # list[tuple(src_idx, tgt_idx)]
 
             src_idx = new_track_indices[0][0]
             tgt_idx = new_track_indices[0][1]
@@ -303,14 +337,50 @@ class ClipMatcher(SetCriterion):
                         l_dict.items()})
         self._step()
         return track_instances
+    
+    def coco_match(self, outputs: dict, targets):
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
+        indices = self.matcher(outputs_without_aux, [targets], use_focal=False)
+        # for idx1 in range(len(indices)):
+        #     for idx2 in range(len(indices[idx1])):
+        #         indices[idx1][idx2] = indices[idx1][idx2].to(outputs['pred_logits'].device)
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes = len(targets.boxes)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # Compute all the requested losses
+        losses = {}
+        for loss in self.losses:
+            new_coco_loss = self.get_coco_loss(loss, outputs, [targets], indices, num_boxes)
+            self.losses_dict.update({'coco_{}'.format(key): value for key, value in new_coco_loss.items()})
+
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, [targets])
+                for loss in self.losses:
+                    if loss == 'masks':
+                        # Intermediate masks losses are too costly to compute, we ignore them.
+                        continue
+                    kwargs = {}
+                    if loss == 'labels':
+                        # Logging is enabled only for the last layer
+                        kwargs = {'log': False}
+                    l_dict = self.get_coco_loss(loss, aux_outputs, [targets], indices, num_boxes, **kwargs)
+                    self.losses_dict.update({'coco_aux{}_{}'.format(i, key): value for key, value in l_dict.items()})
 
     def forward(self, outputs, input_data: dict):
         # losses of each frame are calculated during the model's forwarding and are outputted by the model as outputs['losses_dict].
         losses = outputs.pop("losses_dict")
         num_samples = self.get_num_boxes(self.num_samples)
         for loss_name, loss in losses.items():
-            if loss_name != 'coco_cls_loss' or loss_name != 'coco_bbox_loss':
-                losses[loss_name] /= num_samples
+            losses[loss_name] /= num_samples
         return losses
 
 
@@ -649,7 +719,7 @@ class MOTR(nn.Module):
         # out['dist_loss'] = l1_loss
         return out
 
-    def _forward_coco(self, pure_img, text_emb, track_instances: Instances, gt=None):
+    def _forward_coco(self, pure_img, text_emb, track_instances: Instances):
         with torch.no_grad():
             pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
             clip_feature = self.clip_backbone(pure_img)
@@ -714,12 +784,10 @@ class MOTR(nn.Module):
         outputs_coord = torch.stack(outputs_coords)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-        loss_ce = F.cross_entropy(out['pred_logits'].transpose(1, 2), gt.labels)
-        loss_bbox = F.l1_loss(out['pred_boxes'][0], gt.bbox[0].unsqueeze(0), reduction='none')
-        loss_bbox = loss_bbox.sum()
-        loss = {'loss_ce':loss_ce, 'loss_bbox':loss_bbox}
-        print(loss_ce, loss_bbox)
-        return loss
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        out['hs'] = hs[-1]
+        return out
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         if self.query_denoise > 0:
@@ -871,9 +939,8 @@ class MOTR(nn.Module):
             # this track_instance just provide some initial parameter
             track_instances = self._generate_empty_tracks()
             frame.requires_grad = False
-            loss = self._forward_coco(pure_img, text_emb, track_instances, gt)
-            outputs = loss
-            self.criterion.add_coco_loss(outputs)
+            coco_out = self._forward_coco(pure_img, text_emb, track_instances)
+            self.criterion.coco_match(coco_out, gt)
 
 
         if not self.training:
@@ -925,6 +992,14 @@ def build(args):
                                     'frame_{}_ps{}_loss_bbox'.format(i, j): args.bbox_loss_coef,
                                     'frame_{}_ps{}_loss_giou'.format(i, j): args.giou_loss_coef,
                                     })
+    # add coco weight dict
+    weight_dict.update({"coco_loss_ce":args.cls_loss_coef, 'coco_loss_bbox':args.bbox_loss_coef, 'coco_loss_giou':args.giou_loss_coef})
+    for j in range(args.dec_layers - 1):
+        weight_dict.update({"coco_aux{}_loss_ce".format(j): args.cls_loss_coef,
+                            'coco_aux{}_loss_bbox'.format(j): args.bbox_loss_coef,
+                            'coco_aux{}_loss_giou'.format(j): args.giou_loss_coef,
+                            })
+
     if args.memory_bank_type is not None and len(args.memory_bank_type) > 0:
         memory_bank = build_memory_bank(args, d_model, hidden_dim, d_model * 2)
         for i in range(num_frames_per_batch):
