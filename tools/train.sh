@@ -51,4 +51,4 @@ git diff > git_diff
 echo $PY_ARGS > desc
 echo " ...Done"
 
-python -m torch.distributed.launch --nproc_per_node=4 --use_env main.py ${args} --output_dir . |& tee -a output.log
+python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py ${args} --output_dir . |& tee -a output.log

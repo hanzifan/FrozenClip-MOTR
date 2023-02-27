@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import List
+import matplotlib.pyplot as plt
 
 from util import box_ops, checkpoint
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -32,6 +33,7 @@ from .deformable_transformer_plus import build_deforamble_transformer, pos2posem
 from .qim import build as build_query_interaction_layer
 from .deformable_detr import SetCriterion, MLP, sigmoid_focal_loss
 import clip
+from einops import rearrange
 
 
 class ClipMatcher(SetCriterion):
@@ -49,11 +51,11 @@ class ClipMatcher(SetCriterion):
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         # self.num_classes = num_classes
-        self.num_classes = 8
+        self.num_classes = 1232
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
-        self.focal_loss = True
+        self.focal_loss = False
         self.losses_dict = {}
         self._current_frame_idx = 0
 
@@ -154,7 +156,8 @@ class ClipMatcher(SetCriterion):
         target_classes_o = torch.cat(labels)
         target_classes[idx] = target_classes_o
         if self.focal_loss:
-            gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[:, :, :-1]  # no loss for the last (background) class
+            # gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[:, :, :-1]  # no loss for the last (background) class
+            gt_labels_target = F.one_hot(target_classes, num_classes=self.num_classes + 1)
             gt_labels_target = gt_labels_target.to(src_logits)
             loss_ce = sigmoid_focal_loss(src_logits.flatten(1),
                                              gt_labels_target.flatten(1),
@@ -163,7 +166,8 @@ class ClipMatcher(SetCriterion):
                                              num_boxes=num_boxes, mean_in_dim1=False)
             loss_ce = loss_ce.sum()
         else:
-            loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+            # loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+            loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -171,6 +175,13 @@ class ClipMatcher(SetCriterion):
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
 
         return losses
+
+    def add_coco_loss(self, outputs: dict):
+        cls_loss = outputs['loss_ce']
+        bbox_loss = outputs['loss_bbox']
+        self.losses_dict.update({'coco_{}'.format('cls_loss'): cls_loss})
+        self.losses_dict.update({'coco_{}'.format('bbox_loss'): bbox_loss})
+
 
     def match_for_single_frame(self, outputs: dict):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
@@ -256,7 +267,7 @@ class ClipMatcher(SetCriterion):
                                            num_boxes=1)
             self.losses_dict.update(
                 {'frame_{}_{}'.format(self._current_frame_idx, key): value for key, value in new_track_loss.items()})
-        self.losses_dict.update({'frame_{}_{}'.format(self._current_frame_idx, 'dist_loss'): outputs['dist_loss']})
+        # self.losses_dict.update({'frame_{}_{}'.format(self._current_frame_idx, 'dist_loss'): outputs['dist_loss']})
 
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -298,7 +309,8 @@ class ClipMatcher(SetCriterion):
         losses = outputs.pop("losses_dict")
         num_samples = self.get_num_boxes(self.num_samples)
         for loss_name, loss in losses.items():
-            losses[loss_name] /= num_samples
+            if loss_name != 'coco_cls_loss' or loss_name != 'coco_bbox_loss':
+                losses[loss_name] /= num_samples
         return losses
 
 
@@ -384,20 +396,29 @@ class MOTR(nn.Module):
         """
         super().__init__()
         # NOTE:clip
-        self.my_clip, self.my_preprocess = clip.load("ViT-B/32", device=device)
+        self.my_clip, self.my_preprocess = clip.load("RN50x64", device=device)
+        self.clip_backbone = torch.nn.Sequential(*(list(self.my_clip.visual.children())))[0:-1].float()
+        attention_pooling = torch.nn.Sequential(*(list(self.my_clip.visual.children())))[-1].float()
+        self.attention_pooling_positional_embedding = attention_pooling.positional_embedding
+        self.attention_pooling_v_proj = attention_pooling.v_proj
+        self.attention_pooling_c_proj = attention_pooling.c_proj
         self.my_clip.float()
-        self.clip_text_proj = nn.Linear(512, transformer.d_model)
-        self.clip_img_proj = nn.Linear(512, transformer.d_model)
+        self.cutchannel = nn.Conv2d(in_channels=self.attention_pooling_c_proj.out_features, out_channels=transformer.d_model, kernel_size=1, stride=1, padding=0)
+        self.clip_text_proj = nn.Linear(self.attention_pooling_c_proj.out_features, transformer.d_model)
+        self.bg_embedding = nn.Linear(1,self.attention_pooling_c_proj.out_features)
+        # self.clip_img_proj = nn.Linear(self.attention_pooling_c_proj.out_features, transformer.d_model)
         self.temperature = nn.Parameter(torch.zeros(1), requires_grad=True) #temperature
         # NOTE: distillation
         self.img2clip_proj = nn.Linear(transformer.d_model, transformer.d_model)
+        self.img_clip_align = nn.Linear(transformer.d_model, self.attention_pooling_c_proj.out_features)
         self.dist_loss = nn.L1Loss()
 
         self.num_queries = num_queries
         self.track_embed = track_embed
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.num_classes = 8
+        # self.num_clsses = num_classes
+        self.num_classes = 1232
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
@@ -487,7 +508,7 @@ class MOTR(nn.Module):
         track_instances.scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.track_scores = torch.zeros((len(track_instances),), dtype=torch.float, device=device)
         track_instances.pred_boxes = torch.zeros((len(track_instances), 4), dtype=torch.float, device=device)
-        track_instances.pred_logits = torch.zeros((len(track_instances), self.num_classes), dtype=torch.float, device=device)
+        track_instances.pred_logits = torch.zeros((len(track_instances), self.num_classes+1), dtype=torch.float, device=device)
 
         mem_bank_len = self.mem_bank_len
         track_instances.mem_bank = torch.zeros((len(track_instances), mem_bank_len, d_model), dtype=torch.float32, device=device)
@@ -507,32 +528,48 @@ class MOTR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b, }
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def _forward_single_image(self, samples, img_emb, text_emb, track_instances: Instances, gtboxes=None):
-        features, pos = self.backbone(samples)
-        src, mask = features[-1].decompose()
-        assert mask is not None
+    def _forward_single_image(self, samples, pure_img, text_emb, track_instances: Instances, gtboxes=None):
+        # features, pos = self.backbone(samples)
+        # use frozen clip image encoder as backbone
+        with torch.no_grad():
+            pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
+            clip_feature = self.clip_backbone(pure_img)
+            clip_feature = clip_feature.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+            clip_feature = torch.cat([clip_feature.mean(dim=0, keepdim=True), clip_feature], dim=0)  # (HW+1)NC
+            clip_feature = clip_feature + self.attention_pooling_positional_embedding[:, None, :].to(clip_feature.dtype)  # (HW+1)NC
+            clip_feature = self.attention_pooling_c_proj(self.attention_pooling_v_proj(clip_feature))[1:, :, :]
+            clip_feature = rearrange(clip_feature, '(h w) b c -> b c h w', h=14)
+            clip_feature = torch.sum(clip_feature, dim=0)
+            features = nested_tensor_from_tensor_list([clip_feature])
 
-        srcs = []
-        masks = []
-        for l, feat in enumerate(features):
-            src, mask = feat.decompose()
-            srcs.append(self.input_proj[l](src))
-            masks.append(mask)
-            assert mask is not None
+        src, mask = features.decompose()
+        src = self.cutchannel(src)
+        pos = None
+        srcs = [src]
+        masks = [mask]
+        # assert mask is not None
 
-        if self.num_feature_levels > len(srcs):
-            _len_srcs = len(srcs)
-            for l in range(_len_srcs, self.num_feature_levels):
-                if l == _len_srcs:
-                    src = self.input_proj[l](features[-1].tensors)
-                else:
-                    src = self.input_proj[l](srcs[-1])
-                m = samples.mask
-                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
-                srcs.append(src)
-                masks.append(mask)
-                pos.append(pos_l)
+        # srcs = []
+        # masks = []
+        # for l, feat in enumerate(features):
+        #     src, mask = feat.decompose()
+        #     srcs.append(self.input_proj[l](src))
+        #     masks.append(mask)
+        #     assert mask is not None
+
+        # if self.num_feature_levels > len(srcs):
+        #     _len_srcs = len(srcs)
+        #     for l in range(_len_srcs, self.num_feature_levels):
+        #         if l == _len_srcs:
+        #             src = self.input_proj[l](features[-1].tensors)
+        #         else:
+        #             src = self.input_proj[l](srcs[-1])
+        #         m = samples.mask
+        #         mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+        #         # pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+        #         srcs.append(src)
+        #         masks.append(mask)
+        #         # pos.append(pos_l)
 
         if gtboxes is not None:
             n_dt = len(track_instances)
@@ -550,22 +587,30 @@ class MOTR(nn.Module):
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
 
+        # do img projection to get the same shape with transformer d_model
+        img2clip = self.img_clip_align(hs[-1])
+
         # NOTE:distillation
+        # clip image encoder
         # with torch.no_grad:
         #     pure_image = F.interpolate(pure_image.unsqueeze(0), (224, 224))
         #     clip_img_emb = self.my_clip.encode_image(pure_image)
-        clip_img_emb = img_emb
-        clip_img_emb = self.clip_img_proj(clip_img_emb)
-        img2clip = self.img2clip_proj(hs[-1])
-        l1_loss = self.dist_loss(clip_img_emb, img2clip[:, -1, :])
+        # clip_img_emb = img_emb
+        # clip_img_emb = self.clip_img_proj(clip_img_emb)
+        # img2clip = self.img2clip_proj(hs[-1])
+        # l1_loss = self.dist_loss(clip_img_emb, img2clip[:, -1, :])
 
         # NOTE:clip text encoder
+        # clip text encoder
         # with torch.no_grad():
         #     text = clip.tokenize(["pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"]).to(ref_pts.device)
         #     text_f = self.my_clip.encode_text(text)
         #     text_f = text_f.view(-1, text_f.shape[-2], text_f.shape[-1])
+        # do text projection to get the same shape with transformer d_model
         text_f = text_emb
-        text_f = self.clip_text_proj(text_f)
+        bg_text_f = hs[0].new_ones(1)
+        bg_text_f = self.bg_embedding(bg_text_f).reshape(1, 1, 1024)
+        text_f = torch.cat([text_f, bg_text_f], dim=1)
 
         outputs_classes = []
         outputs_coords = []
@@ -577,11 +622,10 @@ class MOTR(nn.Module):
             reference = inverse_sigmoid(reference)
             # NOTE:multi-modality embedding
             img_f = img2clip
-            text_e = torch.norm(text_f, dim=-1, keepdim=True)
-            img_e = torch.norm(img_f, dim=-1, keepdim=True)
-            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * torch.exp(self.temperature)
-            logits = logits - torch.mean(logits)
-            logits = logits.sigmoid()
+            text_e = text_f / text_f.norm(dim=-1, keepdim=True)
+            img_e = img_f / img_f.norm(dim=-1, keepdim=True)
+            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * 100
+            logits = logits.softmax(dim=-1)
 
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
@@ -602,8 +646,80 @@ class MOTR(nn.Module):
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
         # NOTE: i add this l1 loss
-        out['dist_loss'] = l1_loss
+        # out['dist_loss'] = l1_loss
         return out
+
+    def _forward_coco(self, pure_img, text_emb, track_instances: Instances, gt=None):
+        with torch.no_grad():
+            pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
+            clip_feature = self.clip_backbone(pure_img)
+            clip_feature = clip_feature.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+            clip_feature = torch.cat([clip_feature.mean(dim=0, keepdim=True), clip_feature], dim=0)  # (HW+1)NC
+            clip_feature = clip_feature + self.attention_pooling_positional_embedding[:, None, :].to(clip_feature.dtype)  # (HW+1)NC
+            clip_feature = self.attention_pooling_c_proj(self.attention_pooling_v_proj(clip_feature))[1:, :, :]
+            clip_feature = rearrange(clip_feature, '(h w) b c -> b c h w', h=14)
+            clip_feature = torch.sum(clip_feature, dim=0)
+            features = nested_tensor_from_tensor_list([clip_feature])
+
+        src, mask = features.decompose()
+        src = self.cutchannel(src)
+        pos = None
+        srcs = [src]
+        masks = [mask]
+        query_embed = track_instances.query_pos
+        ref_pts = track_instances.ref_pts
+        attn_mask = None
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+            self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
+                             mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
+
+        # do img projection to get the same shape with transformer d_model
+        img2clip = self.img_clip_align(hs[-1])
+
+        text_f = text_emb
+        bg_text_f = hs[0].new_ones(1)
+        bg_text_f = self.bg_embedding(bg_text_f).reshape(1, 1, 1024)
+        text_f = torch.cat([text_f, bg_text_f], dim=1)
+
+        outputs_classes = []
+        outputs_coords = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            # NOTE:multi-modality embedding
+            img_f = img2clip
+            # text_e = F.normalize(text_f, dim=-1)
+            # img_e = F.normalize(img_f, dim=-1)
+            text_e = text_f / text_f.norm(dim=-1, keepdim=True)
+            img_e = img_f / img_f.norm(dim=-1, keepdim=True)
+            logits = torch.bmm(img_e, text_e.permute(0,2,1)) * 100
+            logits = logits.softmax(dim=-1)
+
+            outputs_class = self.class_embed[lvl](hs[lvl])
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            # outputs_classes.append(outputs_class)
+            outputs_classes.append(logits)
+            outputs_coords.append(outputs_coord)
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
+
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        loss_ce = F.cross_entropy(out['pred_logits'].transpose(1, 2), gt.labels)
+        loss_bbox = F.l1_loss(out['pred_boxes'][0], gt.bbox[0].unsqueeze(0), reduction='none')
+        loss_bbox = loss_bbox.sum()
+        loss = {'loss_ce':loss_ce, 'loss_bbox':loss_bbox}
+        print(loss_ce, loss_bbox)
+        return loss
 
     def _post_process_single_image(self, frame_res, track_instances, is_last):
         if self.query_denoise > 0:
@@ -681,7 +797,7 @@ class MOTR(nn.Module):
             self.criterion.initialize_for_single_clip(data['gt_instances'])
         frames = data['imgs']  # list of Tensor.
         # NOTE:clip preprocess embedding
-        img_embs = data['img_emb']
+        # img_embs = data['img_emb']
         text_embs= data['text_emb']
         outputs = {
             'pred_logits': [],
@@ -689,9 +805,11 @@ class MOTR(nn.Module):
         }
         track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
+        # NOTE:mot dataset train
         # for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
-        for frame_index, (frame, gt, img_emb, text_emb) in enumerate(zip(frames, data['gt_instances'], img_embs, text_embs)):
+        for frame_index, (frame, gt, text_emb) in enumerate(zip(frames, data['gt_instances'], text_embs)):
             frame.requires_grad = False
+            pure_img = frame
             is_last = frame_index == len(frames) - 1
 
             if self.query_denoise > 0:
@@ -716,12 +834,12 @@ class MOTR(nn.Module):
                 def fn(frame, gtboxes, *args):
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, img_emb, text_emb, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, pure_img, text_emb, tmp, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
                         frame_res['hs'],
-                        frame_res['dist_loss'],
+                        # frame_res['dist_loss'],
                         *[aux['pred_logits'] for aux in frame_res['aux_outputs']],
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
@@ -733,21 +851,30 @@ class MOTR(nn.Module):
                     'pred_logits': tmp[0],
                     'pred_boxes': tmp[1],
                     'hs': tmp[2],
-                    'dist_loss': tmp[3],
+                    # 'dist_loss': tmp[3],
                     'aux_outputs': [{
-                        'pred_logits': tmp[4+i],
-                        'pred_boxes': tmp[4+5+i],
+                        'pred_logits': tmp[3+i],
+                        'pred_boxes': tmp[3+5+i],
                     } for i in range(5)],
                 }
             else:
-                pure_image = frame
                 frame = nested_tensor_from_tensor_list([frame])
-                frame_res = self._forward_single_image(frame, img_emb, text_emb, track_instances, gtboxes)
+                frame_res = self._forward_single_image(frame, pure_img, text_emb, track_instances, gtboxes)
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
 
             track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
+
+        # NOTE:coco dataset train
+        for (frame, gt) in zip(data['lvis_img'], [data['lvis_gt']]):
+            # this track_instance just provide some initial parameter
+            track_instances = self._generate_empty_tracks()
+            frame.requires_grad = False
+            loss = self._forward_coco(pure_img, text_emb, track_instances, gt)
+            outputs = loss
+            self.criterion.add_coco_loss(outputs)
+
 
         if not self.training:
             outputs['track_instances'] = track_instances
