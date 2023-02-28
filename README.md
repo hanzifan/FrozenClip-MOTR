@@ -27,3 +27,6 @@
 尝试修复新加入的coco数据classification loss过高的问题（√）<br/>
 使用TAO数据集进行训练（WIP）<br/>
 使用BDD100k测试（WIP）<br/>
+
+# 2.28
+尝试修复无论是mot还是coco的ce_loss降不下去的问题（WIP）<br/>
