@@ -128,7 +128,7 @@ def get_args_parser():
     parser.add_argument('--dataset_file', default='coco')
     parser.add_argument('--gt_file_train', type=str)
     parser.add_argument('--gt_file_val', type=str)
-    parser.add_argument('--coco_path', default='/home/hzf/project/MOTRv2_u/data/', type=str)
+    parser.add_argument('--coco_path', default='/data/hzf_data/tracking/data/', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
@@ -142,20 +142,20 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--vis', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--pretrained', default=None, help='resume from checkpoint')
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
     # end-to-end mot settings.
-    parser.add_argument('--mot_path', default='/home/hzf/project/MOTRv2_u/data/', type=str)
+    parser.add_argument('--mot_path', default='/data/hzf_data/tracking/data/', type=str)
     # parser.add_argument('--mot_path', default='/home/hzf/project/MOTRv2_u/data/', type=str)
     parser.add_argument('--det_db', default='', type=str)
     parser.add_argument('--input_video', default='figs/demo.mp4', type=str)
     parser.add_argument('--data_txt_path_train',
-                        default='/home/hzf/data/bdd/bdd100k/bdd100k.train', type=str,
+                        default='/home/hzf/project/MOTR/datasets/data_path/crowdhuman.train', type=str,
                         help="path to dataset txt split")
     parser.add_argument('--data_txt_path_val',
-                        default='/home/hzf/data/bdd/bdd100k/bdd100k.val', type=str,
+                        default='/home/hzf/project/MOTR/datasets/data_path/crowdhuman.train', type=str,
                         help="path to dataset txt split")
     parser.add_argument('--img_path', default='data/valid/JPEGImages/')
 

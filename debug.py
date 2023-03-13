@@ -17,12 +17,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='clip preprocessing')
     parser.add_argument('--data_name', default='bdd100k')
     parser.add_argument('--base_path', default='/home/hzf/data/bdd/')
-    parser.add_argument('--lvis_path', default='/home/hzf/data/lvis/annotations/lvis_classes.txt')
+    parser.add_argument('--lvis_path', default='/data/hzf_data/coco/coco_labels.txt')
     args = parser.parse_args()
 
     # load clip model
     device='cuda'
-    model, preprocess = clip.load("RN50x64", device=device)
+    model, preprocess = clip.load("RN50", device=device)
     model.float()
     main_path = os.path.join(args.base_path, args.data_name)
 
@@ -37,7 +37,8 @@ if __name__ == '__main__':
     for idx in range(len(lvis_label_list)):
         if lvis_label_list[idx] in bdd_list:
             lvis_label_list[idx] = 'None'
-    lvis_label_list.insert(0, "pedestrian")
+        else:
+            lvis_label_list[idx] = "This is a " + lvis_label_list[idx]
     print(len(lvis_label_list))
     label_emb = clip.tokenize(lvis_label_list).to(device)
     # image_prompt = {}
@@ -52,28 +53,3 @@ if __name__ == '__main__':
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     np.save(os.path.join(save_path, 'text-embedding_lvis.npy'), text_prompt)
-
-    # for i in tqdm.tqdm(range(len(sub_dir_list))):
-    #     sub_dir_name = sub_dir_list[i]
-    #     imgae_list = glob.glob(sub_dir_name + "/*")
-    #     for name in imgae_list:
-    #         current_id = os.path.splitext(os.path.basename(name))[0]
-
-    #         image = preprocess(Image.open(name)).unsqueeze(0).cuda()
-    #         with torch.no_grad():
-    #             prompt_embedding = model.encode_image(image).float().cpu().detach()
-
-    #         image_prompt[current_id] = prompt_embedding
-
-    #     if i == 200:
-    #         save_path = os.path.join(main_path, 'clip-preprocessing')
-    #         if not os.path.exists(save_path):
-    #             os.makedirs(save_path)
-    #         np.save(os.path.join(save_path, 'image-embedding_clip.npy'), image_prompt)
-
-    # save_path = os.path.join(main_path, 'clip-preprocessing')
-    # if not os.path.exists(save_path):
-    #     os.makedirs(save_path)
-    # np.save(os.path.join(save_path, 'image-embedding.npy'), image_prompt)
-    # print('done!')
-

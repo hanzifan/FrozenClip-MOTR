@@ -24,6 +24,9 @@ from main import get_args_parser
 
 from models.structures import Instances
 from torch.utils.data import Dataset, DataLoader
+import clip
+import numpy as np
+from PIL import Image
 
 
 class ListImgDataset(Dataset):
@@ -79,9 +82,10 @@ class ListImgDataset(Dataset):
 
 class Detector(object):
     def __init__(self, args, model, vid):
+        self.text = clip.tokenize(['This is a person']).cuda()
+        self.my_clip, self.my_preprocess = clip.load("RN50x64")
         self.args = args
         self.detr = model
-
         self.vid = vid
         self.seq_num = os.path.basename(vid)
         img_list = os.listdir(os.path.join(self.args.mot_path, vid, 'img1'))
@@ -115,8 +119,13 @@ class Detector(object):
             det_db = json.load(f)
         loader = DataLoader(ListImgDataset(self.args.mot_path, self.img_list, det_db), 1, num_workers=2)
         lines = []
+        # text_emb = self.my_clip.encode_text(self.text)
+        # text_emb = text_emb.view(-1, text_emb.shape[-2], text_emb.shape[-1])
+        text_emb = np.load("/home/hzf/project/MOTRv2_old/clip-preprocessing/text-embedding_lvis.npy", allow_pickle=True)
+        text_emb = torch.from_numpy(text_emb).cuda()
         for i, data in enumerate(tqdm(loader)):
             cur_img, ori_img, proposals = [d[0] for d in data]
+            my_img = Image.open(os.path.join('/data/hzf_data/tracking/data', self.img_list[i]))
             cur_img, proposals = cur_img.cuda(), proposals.cuda()
 
             # track_instances = None
@@ -125,7 +134,7 @@ class Detector(object):
                 track_instances.remove('labels')
             seq_h, seq_w, _ = ori_img.shape
 
-            res = self.detr.inference_single_image(cur_img, (seq_h, seq_w), track_instances, proposals)
+            res = self.detr.inference_single_image(cur_img, (seq_h, seq_w), my_img, text_emb, i, track_instances, proposals)
             track_instances = res['track_instances']
 
             dt_instances = deepcopy(track_instances)

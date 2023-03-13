@@ -134,24 +134,22 @@ class DeformableTransformer(nn.Module):
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
-        # lvl_pos_embed_flatten = []
-        lvl_pos_embed_flatten = None
+        lvl_pos_embed_flatten = []
         spatial_shapes = []
-        # for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
-        for lvl, (src, mask) in enumerate(zip(srcs, masks)):
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
             src = src.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
-            # pos_embed = pos_embed.flatten(2).transpose(1, 2)
-            # lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
-            # lvl_pos_embed_flatten.append(lvl_pos_embed)
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
-        # lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)

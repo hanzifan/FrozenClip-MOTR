@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "env": { "CUDA_VISIBLE_DEVICES": "9"},
+            "env": { "CUDA_VISIBLE_DEVICES": "3"},
             "args": [
                 "--meta_arch", "motr",
                 "--dataset_file", "e2e_dance",
@@ -20,7 +20,7 @@
                 "--lr_drop", "4",
                 "--lr", "2e-4",
                 "--lr_backbone", "2e-5",
-                "--pretrained", "/home/hzf/project/MOTRv2_u/pretrained/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth",
+                "--pretrained", "/home/hzf/project/MOTRv2_old/pretrained/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth",
                 "--batch_size", "1",
                 "--sample_mode", "random_interval",
                 "--sample_interval", "10",
@@ -34,7 +34,9 @@
                 "--num_queries", "10",
                 "--append_crowd",
                 "--det_db", "det_db_motrv2.json",
-                "--use_checkpoint"
+                "--use_checkpoint",
+                "--exp_name", "tracker",
+                "--resume", "/home/hzf/project/MOTRv2_old/exps/motrv2/run7/checkpoint.pth"
             ]
         }
     ]

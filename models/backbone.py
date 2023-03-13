@@ -22,6 +22,7 @@ from typing import Dict, List
 
 from util.misc import NestedTensor, is_main_process
 from .position_encoding import build_position_encoding
+import clip
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
@@ -63,13 +64,43 @@ class FrozenBatchNorm2d(torch.nn.Module):
         bias = b - rm * scale
         return x * scale + bias
 
+class CLIPBackboneBase(nn.Module):
+
+    def __init__(self, backbone: nn.Module, train_backbone: bool, return_interm_layers: bool):
+        super().__init__()
+        for name, parameter in backbone.named_parameters():
+            # if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+            #     parameter.requires_grad_(False)
+            if not train_backbone:
+                parameter.requires_grad_(False)
+
+        if return_interm_layers:
+            return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
+            self.strides = [8, 16, 32]
+            self.num_channels = [512, 1024, 2048]
+        else:
+            return_layers = {'layer4': "0"}
+            self.strides = [32]
+            self.num_channels = [2048]
+        self.body = backbone
+
+    def forward(self, tensor_list: NestedTensor):
+        x = self.body(tensor_list.tensors)
+        out: Dict[str, NestedTensor] = {}
+        m = tensor_list.mask
+        assert m is not None
+        mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+        out = NestedTensor(x, mask)
+        return out
 
 class BackboneBase(nn.Module):
 
     def __init__(self, backbone: nn.Module, train_backbone: bool, return_interm_layers: bool):
         super().__init__()
         for name, parameter in backbone.named_parameters():
-            if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+            # if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+            #     parameter.requires_grad_(False)
+            if not train_backbone:
                 parameter.requires_grad_(False)
 
         if return_interm_layers:
@@ -109,6 +140,33 @@ class Backbone(BackboneBase):
             self.strides[-1] = self.strides[-1] // 2
 
 
+class CLIP_Backbone(BackboneBase):
+    def __init__(self, name: str,
+                 train_backbone: bool,
+                 return_interm_layers: bool,
+                 dilation: bool,
+                 my_clip,):
+        backbone = my_clip.visual.float().requires_grad_(False)
+        super().__init__(backbone, train_backbone, return_interm_layers)
+
+class CLIPJoiner(nn.Sequential):
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+        self.strides = backbone.strides
+        self.num_channels = backbone.num_channels
+
+    def forward(self, tensor_list: NestedTensor):
+        x = self[0](tensor_list)
+        out: List[NestedTensor] = []
+        pos = []
+        out.append(x)
+
+        # position encoding
+        for x in out:
+            pos.append(self[1](x).to(x.tensors.dtype))
+
+        return out, pos
+
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
@@ -133,6 +191,9 @@ def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks or (args.num_feature_levels > 1)
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    my_clip, my_preprocess = clip.load("RN50")
+    # backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    # model = Joiner(backbone, position_embedding)
+    backbone = CLIP_Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation, my_clip)
     model = Joiner(backbone, position_embedding)
     return model

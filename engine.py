@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from typing import Iterable
+import time
 
 import torch
 import util.misc as utils
@@ -35,26 +36,23 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
+    iter = 0
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for data_dict in metric_logger.log_every(data_loader, print_freq, header):
-    # data_iter = data_loader.__iter__()
-    # for idx in range(len(data_loader)):
-        # if (idx+1)%print_freq == 0:
-        #     print('Epoch: [{}]'.format(epoch))
-        # data_dict = data_iter.__next__()
         data_dict = data_dict_to_cuda(data_dict, device)
-        outputs = model(data_dict)
+        start_model = torch.cuda.Event(enable_timing=True)
+        end_model = torch.cuda.Event(enable_timing=True)
+        start_model.record(stream=torch.cuda.current_stream())
+        outputs = model(data_dict, iter)
+        iter += 1
+        end_model.record(stream=torch.cuda.current_stream())
+        end_model.synchronize()
+        # print('model cost time: %s Seconds'%(start_model.elapsed_time(end_model)/1000))
 
         loss_dict = criterion(outputs, data_dict)
         # print("iter {} after model".format(cnt-1))
         weight_dict = criterion.weight_dict
-        losses = torch.tensor(0.0).to(device)
-        for k in loss_dict.keys():
-            if k in weight_dict:
-                losses += loss_dict[k] * weight_dict[k]
-            else:
-                losses += loss_dict[k]
-        # losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)

@@ -19,12 +19,16 @@ import torch.utils.data
 import os.path as osp
 from PIL import Image, ImageDraw
 import copy
-import datasets.transforms as T
+# import datasets.transforms as T
+import datasets.old_transforms as T
 from models.structures import Instances
+from pycocotools.coco import COCO
+import glob, tqdm, os
 
 
 class DetMOTDetection:
-    def __init__(self, args, data_txt_path: str, seqs_folder, dataset2transform):
+    def __init__(self, args, data_txt_path: str, seqs_folder, dataset2transform, transform):
+        self.transform = transform
         self.args = args
         self.dataset2transform = dataset2transform
         self.num_frames_per_batch = max(args.sampler_lengths)
@@ -61,6 +65,24 @@ class DetMOTDetection:
             self.num_frames_per_batch = self.lengths[0]
             self.current_epoch = 0
 
+        # NOTE: add lvis dataset
+        # load lvis
+        self.lvis_trans = T.Compose([T.ToTensor()])
+        lvis_dir_path = "/data/hzf_data/coco"
+        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/instances_train2017.json")
+        resolve = COCO(lvis_anno_path)
+        self.lvis_img_list = glob.glob(os.path.join(lvis_dir_path, 'images/train2017') + "/*") 
+        self.lvis_anno_list = {}
+        for i in tqdm.tqdm(range(len(self.lvis_img_list))):
+            name = self.lvis_img_list[i]
+            current_id = int(os.path.splitext(os.path.basename(name))[0])
+            if(resolve.getAnnIds(imgIds=current_id) == []):
+                os.remove(name)
+                continue
+            current_anno = resolve.loadAnns(resolve.getAnnIds(imgIds=current_id))[0]
+            self.lvis_anno_list[current_id] = current_anno
+        self.text_emb = np.load("/home/hzf/project/MOTRv2_old/clip-preprocessing/text-embedding_lvis.npy", allow_pickle=True)
+
     def _register_videos(self):
         for label_name in self.label_files:
             video_name = '/'.join(label_name.split('/')[:-1])
@@ -94,12 +116,19 @@ class DetMOTDetection:
         gt_instances.obj_ids = targets['obj_ids']
         gt_instances.area = targets['area']
         return gt_instances
+    
+    @staticmethod
+    def lvis_target_to_instance(targets: dict, img_shape) -> Instances:
+        gt_instances = Instances(tuple(img_shape))
+        gt_instances.labels = torch.tensor([targets['category_id']])
+        gt_instances.boxes = targets['bbox']
+        return gt_instances
 
     def _pre_single_frame(self, idx: int):
         img_path = self.img_files[idx]
         label_path = self.label_files[idx]
-        if 'crowdhuman' in img_path:
-            img_path = img_path.replace('.jpg', '.png')
+        # if 'crowdhuman' in img_path:
+        #     img_path = img_path.replace('.jpg', '.png')
         img = Image.open(img_path)
         targets = {}
         w, h = img._size
@@ -131,6 +160,7 @@ class DetMOTDetection:
         targets['image_id'] = torch.as_tensor(idx)
         targets['size'] = torch.as_tensor([h, w])
         targets['orig_size'] = torch.as_tensor([h, w])
+        targets['text_emb'] = torch.from_numpy(self.text_emb)
         for label in labels:
             targets['boxes'].append(label[2:6].tolist())
             targets['area'].append(label[4] * label[5])
@@ -138,6 +168,38 @@ class DetMOTDetection:
             targets['labels'].append(0)
             obj_id = label[1] + obj_idx_offset if label[1] >= 0 else label[1]
             targets['obj_ids'].append(obj_id)  # relative id
+
+        targets['area'] = torch.as_tensor(targets['area'])
+        targets['iscrowd'] = torch.as_tensor(targets['iscrowd'])
+        targets['labels'] = torch.as_tensor(targets['labels'])
+        targets['obj_ids'] = torch.as_tensor(targets['obj_ids'])
+        targets['boxes'] = torch.as_tensor(targets['boxes'], dtype=torch.float32).reshape(-1, 4)
+        return img, targets
+
+    def _pre_single_coco(self, img, gt, idx):
+        targets = {}
+        w, h = img._size
+        assert w > 0 and h > 0, "invalid image with shape {} {}".format(w, h)
+
+        
+
+        targets['dataset'] = 'coco'
+        targets['boxes'] = []
+        targets['area'] = []
+        targets['iscrowd'] = []
+        targets['labels'] = []
+        targets['obj_ids'] = []
+        targets['image_id'] = torch.as_tensor(idx)
+        targets['size'] = torch.as_tensor([h, w])
+        targets['orig_size'] = torch.as_tensor([h, w])
+        targets['text_emb'] = torch.from_numpy(self.text_emb)
+        # for label in labels:
+        #     targets['boxes'].append(label[2:6].tolist())
+        #     targets['area'].append(label[4] * label[5])
+        #     targets['iscrowd'].append(0)
+        #     targets['labels'].append(0)
+        #     obj_id = label[1] + obj_idx_offset if label[1] >= 0 else label[1]
+        #     targets['obj_ids'].append(obj_id)  # relative id
 
         targets['area'] = torch.as_tensor(targets['area'])
         targets['iscrowd'] = torch.as_tensor(targets['iscrowd'])
@@ -172,15 +234,48 @@ class DetMOTDetection:
         data = {}
         dataset_name = targets[0]['dataset']
         transform = self.dataset2transform[dataset_name]
-        if transform is not None:
+        if self.transform is not None:
             images, targets = transform(images, targets)
         gt_instances = []
+        text_emb = []
         for img_i, targets_i in zip(images, targets):
             gt_instances_i = self._targets_to_instances(targets_i, img_i.shape[1:3])
             gt_instances.append(gt_instances_i)
+            text_emb.append(targets_i['text_emb'])
+
+        # load lvis 3 imge per time
+        lvis_images = []
+        lvis_gts = []
+        for i in range(3):
+            new_idx = (idx+i) % (len(self.lvis_img_list) - 1)
+            lvis_img_path = self.lvis_img_list[new_idx]
+            while(True):
+                lvis_img = Image.open(lvis_img_path)
+                if lvis_img.mode == 'RGB':
+                    break
+                else:
+                    new_idx = (new_idx + 1) % (len(self.lvis_img_list) - 1)
+                    lvis_img_path = self.lvis_img_list[new_idx]
+                    continue
+            lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
+            a, b = self._pre_single_coco(lvis_img, lvis_anno, new_idx)
+            lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
+            lvis_images.append(lvis_img[0])
+            boxes = torch.as_tensor([(lvis_anno[0]['bbox'][0]+lvis_anno[0]['bbox'][2])/2, (lvis_anno[0]['bbox'][1]+lvis_anno[0]['bbox'][3])/2,
+                                     lvis_anno[0]['bbox'][2], lvis_anno[0]['bbox'][3]])
+            w = lvis_img[0].shape[1]
+            h = lvis_img[0].shape[2]
+            boxes = boxes/torch.tensor([[w, h, w, h]], dtype=torch.float32)
+            lvis_anno[0]['bbox'] = boxes
+            lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+            lvis_gts.append(lvis_anno_instance[0])
+
         data.update({
             'imgs': images,
             'gt_instances': gt_instances,
+            'text_emb': text_emb,
+            'lvis_img': lvis_images,
+            'lvis_gt': lvis_gts,
         })
         if self.args.vis:
             data['ori_img'] = [target_i['ori_img'] for target_i in targets]
@@ -196,6 +291,16 @@ class DetMOTDetectionValidation(DetMOTDetection):
         super().__init__(args, seqs_folder, dataset2transform)
 
 
+def build_transform(args, image_set):
+    mot17_train = make_transforms_for_mot17('train', args)
+    mot17_test = make_transforms_for_mot17('val', args)
+
+    if image_set == 'train':
+        return mot17_train
+    elif image_set == 'val':
+        return mot17_test
+    else:
+        raise NotImplementedError()
 
 def make_transforms_for_mot17(image_set, args=None):
 
@@ -280,11 +385,12 @@ def build(image_set, args):
     root = Path(args.mot_path)
     assert root.exists(), f'provided MOT path {root} does not exist'
     dataset2transform = build_dataset2transform(args, image_set)
+    transform = build_transform(args, image_set)
     if image_set == 'train':
         data_txt_path = args.data_txt_path_train
-        dataset = DetMOTDetection(args, data_txt_path=data_txt_path, seqs_folder=root, dataset2transform=dataset2transform)
+        dataset = DetMOTDetection(args, data_txt_path=data_txt_path, seqs_folder=root, dataset2transform=dataset2transform, transform=transform)
     if image_set == 'val':
         data_txt_path = args.data_txt_path_val
-        dataset = DetMOTDetection(args, data_txt_path=data_txt_path, seqs_folder=root, dataset2transform=dataset2transform)
+        dataset = DetMOTDetection(args, data_txt_path=data_txt_path, seqs_folder=root, dataset2transform=dataset2transform, transform=transform)
     return dataset
 

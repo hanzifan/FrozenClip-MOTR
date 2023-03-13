@@ -11,6 +11,7 @@
 """
 DETR model and criterion classes.
 """
+import time
 import copy
 import math
 import numpy as np
@@ -28,12 +29,15 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 from models.structures import Instances, Boxes, pairwise_iou, matched_boxlist_iou
 
 from .backbone import build_backbone
+from .position_encoding import build_position_encoding
 from .matcher import build_matcher
 from .deformable_transformer_plus import build_deforamble_transformer, pos2posemb
 from .qim import build as build_query_interaction_layer
 from .deformable_detr import SetCriterion, MLP, sigmoid_focal_loss
 import clip
 from einops import rearrange
+from torchvision import transforms
+from PIL import ImageDraw
 
 
 class ClipMatcher(SetCriterion):
@@ -51,7 +55,7 @@ class ClipMatcher(SetCriterion):
         """
         super().__init__(num_classes, matcher, weight_dict, losses)
         # self.num_classes = num_classes
-        self.num_classes = 1232
+        self.num_classes = 90
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
@@ -338,7 +342,7 @@ class ClipMatcher(SetCriterion):
         self._step()
         return track_instances
     
-    def coco_match(self, outputs: dict, targets):
+    def coco_match(self, outputs: dict, targets, coco_idx):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -358,7 +362,7 @@ class ClipMatcher(SetCriterion):
         losses = {}
         for loss in self.losses:
             new_coco_loss = self.get_coco_loss(loss, outputs, [targets], indices, num_boxes)
-            self.losses_dict.update({'coco_{}'.format(key): value for key, value in new_coco_loss.items()})
+            self.losses_dict.update({'coco_{}_{}'.format(coco_idx, key): value for key, value in new_coco_loss.items()})
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -373,7 +377,7 @@ class ClipMatcher(SetCriterion):
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
                     l_dict = self.get_coco_loss(loss, aux_outputs, [targets], indices, num_boxes, **kwargs)
-                    self.losses_dict.update({'coco_aux{}_{}'.format(i, key): value for key, value in l_dict.items()})
+                    self.losses_dict.update({'coco_{}_aux{}_{}'.format(coco_idx, i, key): value for key, value in l_dict.items()})
 
     def forward(self, outputs, input_data: dict):
         # losses of each frame are calculated during the model's forwarding and are outputted by the model as outputs['losses_dict].
@@ -427,9 +431,12 @@ class TrackerPostProcess(nn.Module):
         out_logits = track_instances.pred_logits
         out_bbox = track_instances.pred_boxes
 
-        # prob = out_logits.sigmoid()
-        scores = out_logits[..., 0].sigmoid()
-        # scores, labels = prob.max(-1)
+        prob = out_logits.sigmoid()
+        # scores = out_logits[..., 0].sigmoid()
+        scores, labels = prob.max(-1)
+        for idx in range(len(labels)):
+            if labels[idx] == 90:
+                scores[idx] = 0.0
 
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
@@ -440,7 +447,8 @@ class TrackerPostProcess(nn.Module):
 
         track_instances.boxes = boxes
         track_instances.scores = scores
-        track_instances.labels = torch.full_like(scores, 0)
+        track_instances.labels = labels
+        # track_instances.labels = torch.full_like(scores, 0)
         # track_instances.remove('pred_logits')
         # track_instances.remove('pred_boxes')
         return track_instances
@@ -451,7 +459,7 @@ def _get_clones(module, N):
 
 
 class MOTR(nn.Module):
-    def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed, device,
+    def __init__(self, backbone, pos_emb, transformer, num_classes, num_queries, num_feature_levels, criterion, track_embed, device,
                  aux_loss=True, with_box_refine=False, two_stage=False, memory_bank=None, use_checkpoint=False, query_denoise=0):
         """ Initializes the model.
         Parameters:
@@ -466,14 +474,12 @@ class MOTR(nn.Module):
         """
         super().__init__()
         # NOTE:clip
-        self.my_clip, self.my_preprocess = clip.load("RN50x64", device=device)
-        self.clip_backbone = torch.nn.Sequential(*(list(self.my_clip.visual.children())))[0:-1].float()
+        self.my_clip, self.my_preprocess = clip.load("RN50", device=device)
         attention_pooling = torch.nn.Sequential(*(list(self.my_clip.visual.children())))[-1].float()
         self.attention_pooling_positional_embedding = attention_pooling.positional_embedding
         self.attention_pooling_v_proj = attention_pooling.v_proj
         self.attention_pooling_c_proj = attention_pooling.c_proj
         self.my_clip.float()
-        self.cutchannel = nn.Conv2d(in_channels=self.attention_pooling_c_proj.out_features, out_channels=transformer.d_model, kernel_size=1, stride=1, padding=0)
         self.clip_text_proj = nn.Linear(self.attention_pooling_c_proj.out_features, transformer.d_model)
         self.bg_embedding = nn.Linear(1,self.attention_pooling_c_proj.out_features)
         # self.clip_img_proj = nn.Linear(self.attention_pooling_c_proj.out_features, transformer.d_model)
@@ -488,7 +494,7 @@ class MOTR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         # self.num_clsses = num_classes
-        self.num_classes = 1232
+        self.num_classes = 90
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
@@ -504,6 +510,7 @@ class MOTR(nn.Module):
             input_proj_list = []
             for _ in range(num_backbone_outs):
                 in_channels = backbone.num_channels[_]
+                # in_channels = 4096
                 input_proj_list.append(nn.Sequential(
                     nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, hidden_dim),
@@ -522,6 +529,7 @@ class MOTR(nn.Module):
                     nn.GroupNorm(32, hidden_dim),
                 )])
         self.backbone = backbone
+        self.pos_emb = pos_emb
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
@@ -598,48 +606,33 @@ class MOTR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b, }
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def _forward_single_image(self, samples, pure_img, text_emb, track_instances: Instances, gtboxes=None):
-        # features, pos = self.backbone(samples)
-        # use frozen clip image encoder as backbone
+    def _forward_single_image(self, samples, pure_img, text_emb, track_instances: Instances, iter, gtboxes=None):
         with torch.no_grad():
-            pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
-            clip_feature = self.clip_backbone(pure_img)
-            clip_feature = clip_feature.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
-            clip_feature = torch.cat([clip_feature.mean(dim=0, keepdim=True), clip_feature], dim=0)  # (HW+1)NC
-            clip_feature = clip_feature + self.attention_pooling_positional_embedding[:, None, :].to(clip_feature.dtype)  # (HW+1)NC
-            clip_feature = self.attention_pooling_c_proj(self.attention_pooling_v_proj(clip_feature))[1:, :, :]
-            clip_feature = rearrange(clip_feature, '(h w) b c -> b c h w', h=14)
-            clip_feature = torch.sum(clip_feature, dim=0)
-            features = nested_tensor_from_tensor_list([clip_feature])
+            features, pos = self.backbone(samples)
+        src, mask = features[-1].decompose()
+        assert mask is not None
 
-        src, mask = features.decompose()
-        src = self.cutchannel(src)
-        pos = None
-        srcs = [src]
-        masks = [mask]
-        # assert mask is not None
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
 
-        # srcs = []
-        # masks = []
-        # for l, feat in enumerate(features):
-        #     src, mask = feat.decompose()
-        #     srcs.append(self.input_proj[l](src))
-        #     masks.append(mask)
-        #     assert mask is not None
-
-        # if self.num_feature_levels > len(srcs):
-        #     _len_srcs = len(srcs)
-        #     for l in range(_len_srcs, self.num_feature_levels):
-        #         if l == _len_srcs:
-        #             src = self.input_proj[l](features[-1].tensors)
-        #         else:
-        #             src = self.input_proj[l](srcs[-1])
-        #         m = samples.mask
-        #         mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-        #         # pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
-        #         srcs.append(src)
-        #         masks.append(mask)
-        #         # pos.append(pos_l)
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
 
         if gtboxes is not None:
             n_dt = len(track_instances)
@@ -653,9 +646,14 @@ class MOTR(nn.Module):
             ref_pts = track_instances.ref_pts
             attn_mask = None
 
+        start_transformer = torch.cuda.Event(enable_timing=True)
+        end_transformer = torch.cuda.Event(enable_timing=True)
+        start_transformer.record(stream=torch.cuda.current_stream())
         hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
             self.transformer(srcs, masks, pos, query_embed, ref_pts=ref_pts,
                              mem_bank=track_instances.mem_bank, mem_bank_pad_mask=track_instances.mem_padding_mask, attn_mask=attn_mask)
+        end_transformer.record(stream=torch.cuda.current_stream())
+        end_transformer.synchronize()
 
         # do img projection to get the same shape with transformer d_model
         img2clip = self.img_clip_align(hs[-1])
@@ -715,27 +713,56 @@ class MOTR(nn.Module):
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         out['hs'] = hs[-1]
-        # NOTE: i add this l1 loss
-        # out['dist_loss'] = l1_loss
+        
+        # rectangle bbox
+        # with torch.no_grad():
+        #     img = pure_img.cpu().clone()
+        #     toPIL = transforms.ToPILImage()
+        #     img = toPIL(img)
+        #     a = ImageDraw.ImageDraw(img)
+        #     w, h = pure_img.shape[1], pure_img.shape[2]
+        #     for idx in range(outputs_coord[-1].shape[1]):
+        #         bbox = box_ops.box_cxcywh_to_xyxy(outputs_coord[-1][0][idx])
+        #         bbox = bbox * torch.tensor([[w, h, w, h]], dtype=torch.float32, device=ref_pts.device)
+        #         bbox = bbox.cpu().detach().numpy()
+        #         a.rectangle((bbox),outline ='black',width=5)
+        #     img_name = '/home/hzf/project/MOTRv2/bbox/' + str(iter)
+        #     img_name = img_name + '.jpg'
+        #     img.save(img_name)
+
         return out
 
-    def _forward_coco(self, pure_img, text_emb, track_instances: Instances):
-        with torch.no_grad():
-            pure_img = F.interpolate(pure_img.unsqueeze(0), (448, 448))
-            clip_feature = self.clip_backbone(pure_img)
-            clip_feature = clip_feature.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
-            clip_feature = torch.cat([clip_feature.mean(dim=0, keepdim=True), clip_feature], dim=0)  # (HW+1)NC
-            clip_feature = clip_feature + self.attention_pooling_positional_embedding[:, None, :].to(clip_feature.dtype)  # (HW+1)NC
-            clip_feature = self.attention_pooling_c_proj(self.attention_pooling_v_proj(clip_feature))[1:, :, :]
-            clip_feature = rearrange(clip_feature, '(h w) b c -> b c h w', h=14)
-            clip_feature = torch.sum(clip_feature, dim=0)
-            features = nested_tensor_from_tensor_list([clip_feature])
+    def _forward_coco(self, samples, pure_img, text_emb, track_instances: Instances):
+        # with torch.no_grad():
+        #     features, pos = self.backbone(samples)
+        #     src, mask = features[-1].decompose()
+        #     assert mask is not None
+        features, pos = self.backbone(samples)
+        src, mask = features[-1].decompose()
+        assert mask is not None
 
-        src, mask = features.decompose()
-        src = self.cutchannel(src)
-        pos = None
-        srcs = [src]
-        masks = [mask]
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
+
         query_embed = track_instances.query_pos
         ref_pts = track_instances.ref_pts
         attn_mask = None
@@ -811,9 +838,12 @@ class MOTR(nn.Module):
             if self.training:
                 track_scores = frame_res['pred_logits'][0, :].sigmoid().max(dim=-1).values
             else:
-                track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+                # track_scores = frame_res['pred_logits'][0, :, 0].sigmoid()
+                prob = frame_res['pred_logits'][0, :].sigmoid()
+                track_scores, track_labels = prob.max(-1)
 
         track_instances.scores = track_scores
+        # track_instances.labels = track_labels
         track_instances.pred_logits = frame_res['pred_logits'][0]
         track_instances.pred_boxes = frame_res['pred_boxes'][0]
         track_instances.output_embedding = frame_res['hs'][0]
@@ -836,21 +866,42 @@ class MOTR(nn.Module):
         return frame_res
 
     @torch.no_grad()
-    def inference_single_image(self, img, ori_img_size, track_instances=None, proposals=None):
+    def inference_single_image(self, img, ori_img_size, ori_img, text_emb, iter, track_instances=None, proposals=None):
+        pure_img = img.squeeze(0)
         if not isinstance(img, NestedTensor):
             img = nested_tensor_from_tensor_list(img)
         if track_instances is None:
-            track_instances = self._generate_empty_tracks(proposals)
+            # track_instances = self._generate_empty_tracks(proposals)
+            track_instances = self._generate_empty_tracks()
         else:
             track_instances = Instances.cat([
-                self._generate_empty_tracks(proposals),
+                # self._generate_empty_tracks(proposals),
+                self._generate_empty_tracks(),
                 track_instances])
-        res = self._forward_single_image(img,
-                                         track_instances=track_instances)
+        res = self._forward_single_image(img, pure_img, text_emb,
+                                         track_instances=track_instances, iter=iter)
         res = self._post_process_single_image(res, track_instances, False)
-
         track_instances = res['track_instances']
         track_instances = self.post_process(track_instances, ori_img_size)
+
+        # rectangle bbox
+        with torch.no_grad():
+            my_img = ori_img
+            # my_img = ori_img.cpu().clone()
+            # toPIL = transforms.ToPILImage()
+            # img = toPIL(img)
+            a = ImageDraw.ImageDraw(ori_img)
+            prob = track_instances.pred_logits.sigmoid()
+            scores, labels = prob.max(-1)
+            for idx in range(track_instances.boxes.shape[0]):
+                # bbox = box_ops.box_cxcywh_to_xyxy(track_instances.boxes[idx])
+                bbox = track_instances.boxes[idx]
+                bbox = bbox.cpu().detach().numpy()
+                if labels[idx] != 90:
+                    a.rectangle((bbox),outline ='black',width=5)
+            img_name = '/home/hzf/project/MOTRv2_old/bbox/' + str(iter)
+            img_name = img_name + '.jpg'
+            my_img.save(img_name)
         ret = {'track_instances': track_instances}
         if 'ref_pts' in res:
             ref_pts = res['ref_pts']
@@ -860,7 +911,7 @@ class MOTR(nn.Module):
             ret['ref_pts'] = ref_pts
         return ret
 
-    def forward(self, data: dict):
+    def forward(self, data: dict, iter):
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'])
         frames = data['imgs']  # list of Tensor.
@@ -875,6 +926,9 @@ class MOTR(nn.Module):
         keys = list(self._generate_empty_tracks()._fields.keys())
         # NOTE:mot dataset train
         # for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
+        start_mot = torch.cuda.Event(enable_timing=True)
+        end_mot = torch.cuda.Event(enable_timing=True)
+        start_mot.record(stream=torch.cuda.current_stream())
         for frame_index, (frame, gt, text_emb) in enumerate(zip(frames, data['gt_instances'], text_embs)):
             frame.requires_grad = False
             pure_img = frame
@@ -898,11 +952,14 @@ class MOTR(nn.Module):
                     self._generate_empty_tracks(),
                     track_instances])
 
+            start_forward = torch.cuda.Event(enable_timing=True)
+            end_forward = torch.cuda.Event(enable_timing=True)
+            start_forward.record(stream=torch.cuda.current_stream())
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, gtboxes, *args):
                     frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, pure_img, text_emb, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, pure_img, text_emb, tmp, iter, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
@@ -927,20 +984,42 @@ class MOTR(nn.Module):
                 }
             else:
                 frame = nested_tensor_from_tensor_list([frame])
-                frame_res = self._forward_single_image(frame, pure_img, text_emb, track_instances, gtboxes)
+                frame_res = self._forward_single_image(frame, pure_img, text_emb, track_instances, iter, gtboxes)
+            end_forward.record(stream=torch.cuda.current_stream())
+            end_forward.synchronize()
+            # print('forward cost time: %s Seconds'%(start_forward.elapsed_time(end_forward)/1000))
+
+            start_post = torch.cuda.Event(enable_timing=True)
+            end_post = torch.cuda.Event(enable_timing=True)
+            start_post.record(stream=torch.cuda.current_stream())
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last)
+            end_post.record(stream=torch.cuda.current_stream())
+            end_post.synchronize()
+            # print('post cost time: %s Seconds'%(start_post.elapsed_time(end_post)/1000))
 
             track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
+        end_mot.record(stream=torch.cuda.current_stream())
+        end_mot.synchronize()
+        # print('mot cost time: %s Seconds'%(start_mot.elapsed_time(end_mot)/1000))
 
         # NOTE:coco dataset train
-        for (frame, gt) in zip(data['lvis_img'], [data['lvis_gt']]):
-            # this track_instance just provide some initial parameter
-            track_instances = self._generate_empty_tracks()
-            frame.requires_grad = False
-            coco_out = self._forward_coco(pure_img, text_emb, track_instances)
-            self.criterion.coco_match(coco_out, gt)
+        # coco_idx = 0
+        # start_coco = torch.cuda.Event(enable_timing=True)
+        # end_coco = torch.cuda.Event(enable_timing=True)
+        # start_coco.record(stream=torch.cuda.current_stream())
+        # for (frame, gt) in zip(data['lvis_img'], data['lvis_gt']):
+        #     # this track_instance just provide some initial parameter
+        #     track_instances = self._generate_empty_tracks()
+        #     frame.requires_grad = False
+        #     frame = nested_tensor_from_tensor_list([frame])
+        #     coco_out = self._forward_coco(frame, pure_img, text_emb, track_instances)
+        #     self.criterion.coco_match(coco_out, gt, coco_idx)
+        #     coco_idx += 1
+        # end_coco.record(stream=torch.cuda.current_stream())
+        # end_coco.synchronize()
+        # print('coco cost time: %s Seconds'%(start_coco.elapsed_time(end_coco)/1000))
 
 
         if not self.training:
@@ -964,6 +1043,8 @@ def build(args):
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
+    #position embedding
+    pos_emb = build_position_encoding(args)
 
     transformer = build_deforamble_transformer(args)
     d_model = transformer.d_model
@@ -993,12 +1074,15 @@ def build(args):
                                     'frame_{}_ps{}_loss_giou'.format(i, j): args.giou_loss_coef,
                                     })
     # add coco weight dict
-    weight_dict.update({"coco_loss_ce":args.cls_loss_coef, 'coco_loss_bbox':args.bbox_loss_coef, 'coco_loss_giou':args.giou_loss_coef})
-    for j in range(args.dec_layers - 1):
-        weight_dict.update({"coco_aux{}_loss_ce".format(j): args.cls_loss_coef,
-                            'coco_aux{}_loss_bbox'.format(j): args.bbox_loss_coef,
-                            'coco_aux{}_loss_giou'.format(j): args.giou_loss_coef,
-                            })
+    for i in range(3):
+        weight_dict.update({"coco_{}_loss_ce".format(i):args.cls_loss_coef, 
+                            'coco_{}_loss_bbox'.format(i):args.bbox_loss_coef, 
+                            'coco_{}_loss_giou'.format(i):args.giou_loss_coef})
+        for j in range(args.dec_layers - 1):
+            weight_dict.update({"coco_{}_aux{}_loss_ce".format(i, j): args.cls_loss_coef,
+                                'coco_{}_aux{}_loss_bbox'.format(i, j): args.bbox_loss_coef,
+                                'coco_{}_aux{}_loss_giou'.format(i, j): args.giou_loss_coef,
+                                })
 
     if args.memory_bank_type is not None and len(args.memory_bank_type) > 0:
         memory_bank = build_memory_bank(args, d_model, hidden_dim, d_model * 2)
@@ -1012,6 +1096,7 @@ def build(args):
     postprocessors = {}
     model = MOTR(
         backbone,
+        pos_emb,
         transformer,
         track_embed=query_interaction_layer,
         num_feature_levels=args.num_feature_levels,

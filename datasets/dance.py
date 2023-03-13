@@ -25,6 +25,7 @@ import copy
 import datasets.transforms as T
 from models.structures import Instances
 import torch.nn.functional as F
+import random
 
 from random import choice, randint
 from pycocotools.coco import COCO
@@ -67,12 +68,13 @@ class DetMOTDetection:
                         crowd = False
                     x, y, w, h = map(float, (xywh))
                     self.labels_full[vid][t].append([x, y, w, h, i, crowd])
-
         add_mot_folder("DanceTrack/train")
         vid_files = list(self.labels_full.keys())
 
         self.indices = []
         self.vid_tmax = {}
+        #sample
+        vid_files = vid_files[:10000]
         for vid in vid_files:
             self.video_dict[vid] = len(self.video_dict)
             t_min = min(self.labels_full[vid].keys())
@@ -101,17 +103,17 @@ class DetMOTDetection:
         # NOTE: add lvis dataset
         # load lvis
         self.lvis_trans = T.Compose([T.ToTensor()])
-        lvis_dir_path = "/home/hzf/data/lvis"
-        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/lvisv0.5+coco_train.json")
+        lvis_dir_path = "/data/hzf_data/coco"
+        lvis_anno_path = os.path.join(lvis_dir_path, "annotations/instances_train2017.json")
         resolve = COCO(lvis_anno_path)
-        self.lvis_img_list = glob.glob(os.path.join(lvis_dir_path, 'train2017') + "/*") 
+        self.lvis_img_list = glob.glob(os.path.join(lvis_dir_path, 'images/train2017') + "/*") 
         self.lvis_anno_list = {}
         for i in tqdm.tqdm(range(len(self.lvis_img_list))):
             name = self.lvis_img_list[i]
             current_id = int(os.path.splitext(os.path.basename(name))[0])
-            # if(resolve.getAnnIds(imgIds=current_id) == []):
-            #     os.remove(name)
-            #     continue
+            if(resolve.getAnnIds(imgIds=current_id) == []):
+                os.remove(name)
+                continue
             current_anno = resolve.loadAnns(resolve.getAnnIds(imgIds=current_id))[0]
             self.lvis_anno_list[current_id] = current_anno
         
@@ -121,7 +123,7 @@ class DetMOTDetection:
         else:
             self.det_db = defaultdict(list)
 
-        self.text_emb = np.load("/home/hzf/project/MOTRv2/clip-preprocessing/text-embedding_lvis.npy", allow_pickle=True)
+        self.text_emb = np.load("/home/hzf/project/MOTRv2_old/clip-preprocessing/text-embedding_lvis.npy", allow_pickle=True)
 
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -269,33 +271,38 @@ class DetMOTDetection:
                 targets_i['scores'][n_gt:, None],
             ], dim=1))
         
-        # load lvis
-        new_idx = idx % (len(self.lvis_img_list) - 1)
-        lvis_img_path = self.lvis_img_list[new_idx]
-        while(True):
-            lvis_img = Image.open(lvis_img_path)
-            if lvis_img.mode == 'RGB':
-                break
-            else:
-                new_idx = (new_idx + 1) % (len(self.lvis_img_list) - 1)
-                lvis_img_path = self.lvis_img_list[new_idx]
-                continue
-        lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
-        lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
-        boxes = torch.as_tensor([lvis_anno[0]['bbox']])
-        w = lvis_img[0].shape[1]
-        h = lvis_img[0].shape[2]
-        boxes = boxes/torch.tensor([[w, h, w, h]], dtype=torch.float32)
-        lvis_anno[0]['bbox'] = boxes
-        lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+        # # load lvis 3 imge per time
+        # lvis_images = []
+        # lvis_gts = []
+        # for i in range(3):
+        #     new_idx = (idx+i) % (len(self.lvis_img_list) - 1)
+        #     lvis_img_path = self.lvis_img_list[new_idx]
+        #     while(True):
+        #         lvis_img = Image.open(lvis_img_path)
+        #         if lvis_img.mode == 'RGB':
+        #             break
+        #         else:
+        #             new_idx = (new_idx + 1) % (len(self.lvis_img_list) - 1)
+        #             lvis_img_path = self.lvis_img_list[new_idx]
+        #             continue
+        #     lvis_anno = self.lvis_anno_list[int(os.path.basename(lvis_img_path).split('.')[0])]
+        #     lvis_img, lvis_anno = self.transform([lvis_img], [lvis_anno])
+        #     lvis_images.append(lvis_img[0])
+        #     boxes = torch.as_tensor([lvis_anno[0]['bbox']])
+        #     w = lvis_img[0].shape[1]
+        #     h = lvis_img[0].shape[2]
+        #     boxes = boxes/torch.tensor([[w, h, w, h]], dtype=torch.float32)
+        #     lvis_anno[0]['bbox'] = boxes
+        #     lvis_anno_instance = self.lvis_target_to_instance(lvis_anno[0], lvis_img[0].shape[1:3])
+        #     lvis_gts.append(lvis_anno_instance[0])
 
         return {
             'imgs': images,
             'gt_instances': gt_instances,
             'proposals': proposals,
             'text_emb': text_emb,
-            'lvis_img': lvis_img,
-            'lvis_gt': lvis_anno_instance,
+            # 'lvis_img': lvis_images,
+            # 'lvis_gt': lvis_gts,
         }
 
     def __len__(self):
