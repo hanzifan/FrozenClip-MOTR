@@ -30,3 +30,6 @@
 
 # 2.28
 尝试修复无论是mot还是coco的ce_loss降不下去的问题（WIP）<br/>
+
+# 3.10
+尝试修复无论是mot还是coco的ce_loss降不下去的问题（√）<br/>
